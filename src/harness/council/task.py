@@ -14,7 +14,7 @@ from .. import models as m
 from ..agent_runtime import clip_untrusted
 from ..containers import ContainerManager
 from ..db import Database
-from ..forum import MAX_POST_CHARS, Forum, RateLimited
+from ..message_board import MAX_POST_CHARS, MessageBoard, RateLimited
 from ..llm import LLMClient
 from ..logging_ import EventLogger
 from .agents import (
@@ -55,7 +55,7 @@ async def run_council(
     llm: LLMClient,
     tools: CouncilTools,
     db: Database,
-    forum: Forum,
+    message_board: MessageBoard,
     topic_id: str,
     checkout: str,
     finder_id: str,
@@ -68,13 +68,13 @@ async def run_council(
     max_pocs: int | None = None,
 ) -> CouncilResult:
     for subscriber in (finder_id, killer_id, judge_id, exploit_id):
-        await _subscribe(forum, subscriber, topic_id)
+        await _subscribe(message_board, subscriber, topic_id)
 
     candidates = await finder_audit(
         llm, tools, db, topic_id, finder_id, checkout, logger=logger
     )
     candidates = candidates[:MAX_FINDINGS]
-    await _announce_all(forum, topic_id, finder_id, candidates)
+    await _announce_all(message_board, topic_id, finder_id, candidates)
 
     review_limit = max_reviewed if max_reviewed is not None else _max_reviewed()
     review_limit = max(1, review_limit)
@@ -111,7 +111,7 @@ async def run_council(
         elif status is m.FindingStatus.KILLED:
             killed += 1
 
-    workspace = _workspace_for(forum, exploit_id)
+    workspace = _workspace_for(message_board, exploit_id)
     notes = _grouped_notes(survivors)
     poc_limit = max_pocs if max_pocs is not None else _max_pocs()
     poc_limit = max(1, poc_limit)
@@ -129,7 +129,7 @@ async def run_council(
             checkout,
             workspace,
             exploit_id,
-            forum,
+            message_board,
             logger,
             notes,
         )
@@ -241,7 +241,7 @@ async def _run_sandbox_pocs(
     checkout: str,
     workspace: Path,
     exploit_id: str,
-    forum: Forum,
+    message_board: MessageBoard,
     logger: EventLogger | None,
     notes: list[str],
 ) -> tuple[int, int, int] | None:
@@ -252,7 +252,7 @@ async def _run_sandbox_pocs(
             container_id = container.id
         except Exception as exc:
             _log_event(
-                forum,
+                message_board,
                 "council_sandbox_unavailable",
                 exploit_id=exploit_id,
                 error=f"{type(exc).__name__}: {exc}",
@@ -289,7 +289,7 @@ async def _run_sandbox_pocs(
                     else "proof-of-concept did not succeed in the sandbox"
                 )
                 _log_event(
-                    forum, "council_poc_failed", finding_id=finding.id, reason=reason
+                    message_board, "council_poc_failed", finding_id=finding.id, reason=reason
                 )
         return (exploited, pocs_run, pocs_succeeded)
     finally:
@@ -298,7 +298,7 @@ async def _run_sandbox_pocs(
                 await containers.remove(container_id)
             except Exception as exc:
                 _log_event(
-                    forum,
+                    message_board,
                     "council_container_remove_failed",
                     container_id=container_id,
                     error=f"{type(exc).__name__}: {exc}",
@@ -314,12 +314,12 @@ def _log_logger(logger: EventLogger | None, kind: str, **fields: Any) -> None:
         return
 
 
-async def _subscribe(forum: Forum, agent_id: str, topic_id: str) -> None:
+async def _subscribe(message_board: MessageBoard, agent_id: str, topic_id: str) -> None:
     try:
-        await forum.subscribe(agent_id, topic_id)
+        await message_board.subscribe(agent_id, topic_id)
     except Exception as exc:  # noqa: BLE001
         _log_event(
-            forum,
+            message_board,
             "council_subscribe_failed",
             agent_id=agent_id,
             topic_id=topic_id,
@@ -328,7 +328,7 @@ async def _subscribe(forum: Forum, agent_id: str, topic_id: str) -> None:
 
 
 async def _announce_all(
-    forum: Forum, topic_id: str, agent_id: str, findings: list[m.Finding]
+    message_board: MessageBoard, topic_id: str, agent_id: str, findings: list[m.Finding]
 ) -> None:
     if not findings:
         return
@@ -352,10 +352,10 @@ async def _announce_all(
         )
     body = "\n".join(lines)[:MAX_POST_CHARS]
     try:
-        await forum.post(agent_id, topic_id, body, refs=refs)
+        await message_board.post(agent_id, topic_id, body, refs=refs)
     except RateLimited as exc:
         _log_event(
-            forum,
+            message_board,
             "council_announce_rate_limited",
             agent_id=agent_id,
             topic_id=topic_id,
@@ -364,7 +364,7 @@ async def _announce_all(
         )
     except Exception as exc:  # noqa: BLE001
         _log_event(
-            forum,
+            message_board,
             "council_announce_failed",
             agent_id=agent_id,
             topic_id=topic_id,
@@ -374,7 +374,7 @@ async def _announce_all(
 
 
 async def _announce(
-    forum: Forum, topic_id: str, agent_id: str, finding: m.Finding
+    message_board: MessageBoard, topic_id: str, agent_id: str, finding: m.Finding
 ) -> None:
     path = " -> ".join(finding.call_path) if finding.call_path else "(none)"
     body = (
@@ -393,10 +393,10 @@ async def _announce(
         }
     ]
     try:
-        await forum.post(agent_id, topic_id, body, refs=refs)
+        await message_board.post(agent_id, topic_id, body, refs=refs)
     except RateLimited as exc:
         _log_event(
-            forum,
+            message_board,
             "council_announce_rate_limited",
             agent_id=agent_id,
             topic_id=topic_id,
@@ -405,7 +405,7 @@ async def _announce(
         )
     except Exception as exc:  # noqa: BLE001
         _log_event(
-            forum,
+            message_board,
             "council_announce_failed",
             agent_id=agent_id,
             topic_id=topic_id,
@@ -414,8 +414,8 @@ async def _announce(
         )
 
 
-def _log_event(forum: Forum, kind: str, **fields: Any) -> None:
-    logger = getattr(forum, "logger", None)
+def _log_event(message_board: MessageBoard, kind: str, **fields: Any) -> None:
+    logger = getattr(message_board, "logger", None)
     if logger is None:
         return
     try:
@@ -424,10 +424,10 @@ def _log_event(forum: Forum, kind: str, **fields: Any) -> None:
         return
 
 
-def _workspace_for(forum: Forum, exploit_id: str) -> Path:
+def _workspace_for(message_board: MessageBoard, exploit_id: str) -> Path:
     if not is_valid_id(exploit_id):
         raise ValueError(f"invalid exploit id: {exploit_id!r}")
-    return Path(forum.settings.workspace_dir) / exploit_id
+    return Path(message_board.settings.workspace_dir) / exploit_id
 
 
 def _grouped_notes(findings: list[m.Finding]) -> list[str]:

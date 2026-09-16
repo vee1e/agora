@@ -17,7 +17,7 @@ from .council.agents import CouncilResult
 from .council.executor import build_combined_tools
 from .council.task import run_council
 from .db import Database
-from .forum import Forum, InvalidPost, RateLimited
+from .message_board import MessageBoard, InvalidPost, RateLimited
 from .llm import LLMBudgetError, LLMClient, LLMError
 from .logging_ import EventLogger
 from .mailbox import Mailbox
@@ -31,7 +31,7 @@ ROLE_CHOICES = [role.value for role in m.AgentRole]
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="harness", description="Agent forum harness control CLI."
+        prog="harness", description="Harness control CLI for the agent message board."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -46,7 +46,7 @@ def _build_parser() -> argparse.ArgumentParser:
     spawn = subparsers.add_parser("spawn", help="spawn one agent")
     spawn.add_argument("--role", required=True, choices=ROLE_CHOICES)
 
-    post = subparsers.add_parser("post", help="append a forum post")
+    post = subparsers.add_parser("post", help="append a message board post")
     post.add_argument("--topic", required=True)
     post.add_argument("--body", required=True)
     post.add_argument("--agent", required=True)
@@ -159,10 +159,10 @@ async def _cmd_post(
     logger = EventLogger(settings.log_dir, max_bytes=settings.log_max_bytes)
     try:
         await db.init_schema()
-        forum = Forum(db, Mailbox(db, logger=logger), settings, logger=logger)
+        message_board = MessageBoard(db, Mailbox(db, logger=logger), settings, logger=logger)
         try:
-            topic = await forum.ensure_topic(topic_title)
-            result = await forum.post(agent_id, topic.id, body)
+            topic = await message_board.ensure_topic(topic_title)
+            result = await message_board.post(agent_id, topic.id, body)
         except RateLimited as exc:
             print(f"rate limited: {exc}", file=sys.stderr)
             return 1
@@ -183,10 +183,10 @@ async def _cmd_subscribe(
     logger = EventLogger(settings.log_dir, max_bytes=settings.log_max_bytes)
     try:
         await db.init_schema()
-        forum = Forum(db, Mailbox(db, logger=logger), settings, logger=logger)
+        message_board = MessageBoard(db, Mailbox(db, logger=logger), settings, logger=logger)
         try:
-            topic = await forum.ensure_topic(topic_title)
-            await forum.subscribe(agent_id, topic.id)
+            topic = await message_board.ensure_topic(topic_title)
+            await message_board.subscribe(agent_id, topic.id)
         except InvalidPost as exc:
             print(f"invalid topic: {exc}", file=sys.stderr)
             return 1
@@ -294,7 +294,7 @@ async def _cmd_council_run(
     created: list[str] = []
     try:
         await db.init_schema()
-        forum = Forum(db, Mailbox(db, logger=logger), settings, logger=logger)
+        message_board = MessageBoard(db, Mailbox(db, logger=logger), settings, logger=logger)
         finder = await db.create_agent(m.AgentRole.FINDER)
         created.append(finder.id)
         killer = await db.create_agent(m.AgentRole.KILLER)
@@ -303,14 +303,14 @@ async def _cmd_council_run(
         created.append(judge.id)
         exploit = await db.create_agent(m.AgentRole.EXPLOIT)
         created.append(exploit.id)
-        topic = await forum.ensure_topic(topic_title, owner_id=finder.id)
+        topic = await message_board.ensure_topic(topic_title, owner_id=finder.id)
         tools = build_combined_tools(checkout)
         try:
             result = await run_council(
                 llm,
                 tools,
                 db,
-                forum,
+                message_board,
                 topic.id,
                 checkout,
                 finder.id,

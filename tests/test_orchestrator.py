@@ -18,7 +18,7 @@ from harness.budget import BudgetGuard
 from harness.config import Settings
 from harness.containers import ContainerManager
 from harness.db import Database
-from harness.forum import Forum
+from harness.message_board import MessageBoard
 from harness.llm import LLMResponse
 from harness.logging_ import EventLogger
 from harness.mailbox import Mailbox
@@ -253,7 +253,7 @@ def make_orch(
     tools: Any = None,
 ) -> Orchestrator:
     mailbox = Mailbox(db, logger=logger)
-    forum = Forum(db, mailbox, settings, logger=logger)
+    message_board = MessageBoard(db, mailbox, settings, logger=logger)
     return Orchestrator(
         settings,
         db,
@@ -263,7 +263,7 @@ def make_orch(
         BudgetGuard(db, settings, logger=logger),
         StateMachine(db, logger=logger),
         llm,
-        forum,
+        message_board,
         tools=tools,
     )
 
@@ -681,10 +681,10 @@ async def test_post_to_wake_path(
     subscriber = await db.create_agent(
         m.AgentRole.KILLER, state=m.AgentState.PAUSED
     )
-    topic = await orch.forum.ensure_topic("wake topic", owner_id=author.id)
-    await orch.forum.subscribe(subscriber.id, topic.id)
+    topic = await orch.message_board.ensure_topic("wake topic", owner_id=author.id)
+    await orch.message_board.subscribe(subscriber.id, topic.id)
 
-    result = await orch.forum.post(author.id, topic.id, "hello board")
+    result = await orch.message_board.post(author.id, topic.id, "hello board")
 
     assert result.woken == [subscriber.id]
     assert await db.count_unread(subscriber.id) == 1
@@ -703,10 +703,10 @@ async def test_tick_digests_topic_after_n_posts(
     llm = FakeLLM(text="digest body")
     orch = make_orch(config, db, logger, llm)
     author = await db.create_agent(m.AgentRole.FINDER)
-    topic = await orch.forum.ensure_topic("digest topic", owner_id=author.id)
-    await orch.forum.post(author.id, topic.id, "one")
+    topic = await orch.message_board.ensure_topic("digest topic", owner_id=author.id)
+    await orch.message_board.post(author.id, topic.id, "one")
     assert await db.latest_digest(topic.id) is None
-    await orch.forum.post(author.id, topic.id, "two")
+    await orch.message_board.post(author.id, topic.id, "two")
 
     await orch.tick()
 
@@ -727,8 +727,8 @@ async def test_tick_digest_failure_does_not_break_tick(
     llm = FakeLLM(error=RuntimeError("boom"))
     orch = make_orch(config, db, logger, llm)
     author = await db.create_agent(m.AgentRole.FINDER)
-    topic = await orch.forum.ensure_topic("fail topic", owner_id=author.id)
-    await orch.forum.post(author.id, topic.id, "one")
+    topic = await orch.message_board.ensure_topic("fail topic", owner_id=author.id)
+    await orch.message_board.post(author.id, topic.id, "one")
 
     await orch.tick()
 
@@ -743,10 +743,10 @@ async def test_tick_digests_at_most_one_topic_per_tick(
     llm = FakeLLM(text="d")
     orch = make_orch(config, db, logger, llm)
     author = await db.create_agent(m.AgentRole.FINDER)
-    first = await orch.forum.ensure_topic("topic a", owner_id=author.id)
-    second = await orch.forum.ensure_topic("topic b", owner_id=author.id)
-    await orch.forum.post(author.id, first.id, "one")
-    await orch.forum.post(author.id, second.id, "one")
+    first = await orch.message_board.ensure_topic("topic a", owner_id=author.id)
+    second = await orch.message_board.ensure_topic("topic b", owner_id=author.id)
+    await orch.message_board.post(author.id, first.id, "one")
+    await orch.message_board.post(author.id, second.id, "one")
 
     await orch.tick()
     assert len(llm.calls) == 1
@@ -840,7 +840,7 @@ async def test_tick_digests_when_threshold_above_read_limit(
     llm = FakeLLM(text="digest body")
     orch = make_orch(config, db, logger, llm)
     author = await db.create_agent(m.AgentRole.FINDER)
-    topic = await orch.forum.ensure_topic("wide threshold", owner_id=author.id)
+    topic = await orch.message_board.ensure_topic("wide threshold", owner_id=author.id)
     for index in range(DIGEST_POST_LIMIT):
         await db.create_post(author.id, topic.id, f"post {index}")
 

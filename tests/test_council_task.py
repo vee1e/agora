@@ -19,7 +19,7 @@ from harness.council.task import (
 )
 from harness.council.tools import CouncilTools
 from harness.db import Database
-from harness.forum import Forum, RateLimited
+from harness.message_board import MessageBoard, RateLimited
 from harness.llm import LLMResponse
 from harness.logging_ import EventLogger
 from harness.mailbox import Mailbox
@@ -98,8 +98,8 @@ async def _seed_agents(db: Database) -> None:
     await db.create_agent(m.AgentRole.EXPLOIT, agent_id="exploit")
 
 
-def _forum(settings: Settings, db: Database, logger: EventLogger) -> Forum:
-    return Forum(db, Mailbox(db, logger), settings, logger)
+def _message_board(settings: Settings, db: Database, logger: EventLogger) -> MessageBoard:
+    return MessageBoard(db, Mailbox(db, logger), settings, logger)
 
 
 async def test_run_council_end_to_end(
@@ -111,7 +111,7 @@ async def test_run_council_end_to_end(
 ) -> None:
     await _seed_agents(db)
     topic = await db.create_topic("audit")
-    forum = _forum(settings, db, logger)
+    message_board = _message_board(settings, db, logger)
 
     candidates = json.dumps(
         [
@@ -145,7 +145,7 @@ async def test_run_council_end_to_end(
         llm,
         tools,
         db,
-        forum,
+        message_board,
         topic.id,
         str(tmp_path),
         "finder",
@@ -185,7 +185,7 @@ async def test_run_council_precision_zero_without_survivors(
 ) -> None:
     await _seed_agents(db)
     topic = await db.create_topic("audit")
-    forum = _forum(settings, db, logger)
+    message_board = _message_board(settings, db, logger)
 
     llm = ScriptedLLM(
         [
@@ -211,7 +211,7 @@ async def test_run_council_precision_zero_without_survivors(
         llm,
         tools,
         db,
-        forum,
+        message_board,
         topic.id,
         str(tmp_path),
         "finder",
@@ -236,7 +236,7 @@ async def test_run_council_groups_two_sinks_on_one_path(
 ) -> None:
     await _seed_agents(db)
     topic = await db.create_topic("audit")
-    forum = _forum(settings, db, logger)
+    message_board = _message_board(settings, db, logger)
 
     shared_path = ["run", "dispatch", "copy_payload"]
     candidates = json.dumps(
@@ -272,7 +272,7 @@ async def test_run_council_groups_two_sinks_on_one_path(
         llm,
         tools,
         db,
-        forum,
+        message_board,
         topic.id,
         str(tmp_path),
         "finder",
@@ -298,7 +298,7 @@ async def test_run_council_no_note_for_distinct_paths(
 ) -> None:
     await _seed_agents(db)
     topic = await db.create_topic("audit")
-    forum = _forum(settings, db, logger)
+    message_board = _message_board(settings, db, logger)
 
     candidates = json.dumps(
         [
@@ -331,7 +331,7 @@ async def test_run_council_no_note_for_distinct_paths(
         llm,
         tools,
         db,
-        forum,
+        message_board,
         topic.id,
         str(tmp_path),
         "finder",
@@ -352,7 +352,7 @@ async def test_run_council_undecided_excluded_from_precision(
 ) -> None:
     await _seed_agents(db)
     topic = await db.create_topic("audit")
-    forum = _forum(settings, db, logger)
+    message_board = _message_board(settings, db, logger)
 
     candidates = json.dumps(
         [
@@ -379,7 +379,7 @@ async def test_run_council_undecided_excluded_from_precision(
         llm,
         tools,
         db,
-        forum,
+        message_board,
         topic.id,
         str(tmp_path),
         "finder",
@@ -409,7 +409,7 @@ async def test_run_council_notes_only_among_survivors(
 ) -> None:
     await _seed_agents(db)
     topic = await db.create_topic("audit")
-    forum = _forum(settings, db, logger)
+    message_board = _message_board(settings, db, logger)
 
     shared_path = ["run", "dispatch", "copy_payload"]
     candidates = json.dumps(
@@ -444,7 +444,7 @@ async def test_run_council_notes_only_among_survivors(
         llm,
         tools,
         db,
-        forum,
+        message_board,
         topic.id,
         str(tmp_path),
         "finder",
@@ -467,7 +467,7 @@ async def test_run_council_notes_do_not_group_across_files(
 ) -> None:
     await _seed_agents(db)
     topic = await db.create_topic("audit")
-    forum = _forum(settings, db, logger)
+    message_board = _message_board(settings, db, logger)
 
     shared_path = ["run", "dispatch"]
     candidates = json.dumps(
@@ -493,7 +493,7 @@ async def test_run_council_notes_do_not_group_across_files(
         llm,
         tools,
         db,
-        forum,
+        message_board,
         topic.id,
         str(tmp_path),
         "finder",
@@ -515,14 +515,14 @@ async def test_run_council_subscribes_agents(
 ) -> None:
     await _seed_agents(db)
     topic = await db.create_topic("audit")
-    forum = _forum(settings, db, logger)
+    message_board = _message_board(settings, db, logger)
     llm = ScriptedLLM([_response("[]")])
 
     await run_council(
         llm,
         tools,
         db,
-        forum,
+        message_board,
         topic.id,
         str(tmp_path),
         "finder",
@@ -543,7 +543,7 @@ class _CapturingLogger:
         self.events.append((kind, fields))
 
 
-class _RejectingForum:
+class _RejectingMessageBoard:
     def __init__(self, logger: _CapturingLogger) -> None:
         self.logger = logger
 
@@ -562,7 +562,7 @@ async def test_announce_logs_rate_limit(db: Database) -> None:
         call_path=["run"],
     )
 
-    await _announce(_RejectingForum(logger), "topic", "finder", finding)
+    await _announce(_RejectingMessageBoard(logger), "topic", "finder", finding)
 
     kinds = [kind for kind, _ in logger.events]
     assert kinds == ["council_announce_rate_limited"]
@@ -571,11 +571,11 @@ async def test_announce_logs_rate_limit(db: Database) -> None:
 def test_workspace_for_uses_settings_and_rejects_bad_id(
     settings: Settings, db: Database, logger: EventLogger
 ) -> None:
-    forum = _forum(settings, db, logger)
+    message_board = _message_board(settings, db, logger)
 
-    assert _workspace_for(forum, "exploit") == settings.workspace_dir / "exploit"
+    assert _workspace_for(message_board, "exploit") == settings.workspace_dir / "exploit"
     with pytest.raises(ValueError):
-        _workspace_for(forum, "../evil")
+        _workspace_for(message_board, "../evil")
 
 
 class _TaskSandbox:
@@ -637,7 +637,7 @@ async def test_run_council_sandbox_failure_keeps_survived(
 ) -> None:
     await _seed_agents(db)
     topic = await db.create_topic("audit")
-    forum = _forum(settings, db, logger)
+    message_board = _message_board(settings, db, logger)
     candidates = json.dumps(
         [
             {
@@ -668,7 +668,7 @@ async def test_run_council_sandbox_failure_keeps_survived(
         llm,
         tools,
         db,
-        forum,
+        message_board,
         topic.id,
         str(_poc_checkout(tmp_path)),
         "finder",
@@ -696,7 +696,7 @@ async def test_run_council_sandbox_success_sets_exploited(
 ) -> None:
     await _seed_agents(db)
     topic = await db.create_topic("audit")
-    forum = _forum(settings, db, logger)
+    message_board = _message_board(settings, db, logger)
     candidates = json.dumps(
         [
             {
@@ -725,7 +725,7 @@ async def test_run_council_sandbox_success_sets_exploited(
         llm,
         tools,
         db,
-        forum,
+        message_board,
         topic.id,
         str(checkout),
         "finder",
@@ -753,7 +753,7 @@ async def test_run_council_creates_one_container_and_removes_it(
 ) -> None:
     await _seed_agents(db)
     topic = await db.create_topic("audit")
-    forum = _forum(settings, db, logger)
+    message_board = _message_board(settings, db, logger)
     candidates = json.dumps(
         [
             {
@@ -798,7 +798,7 @@ async def test_run_council_creates_one_container_and_removes_it(
         llm,
         tools,
         db,
-        forum,
+        message_board,
         topic.id,
         str(_poc_checkout(tmp_path)),
         "finder",
@@ -828,7 +828,7 @@ async def test_run_council_sandbox_create_failure_falls_back_to_host(
 ) -> None:
     await _seed_agents(db)
     topic = await db.create_topic("audit")
-    forum = _forum(settings, db, logger)
+    message_board = _message_board(settings, db, logger)
     candidates = json.dumps(
         [
             {"file": "sample.c", "line": 6, "sink": "strcpy", "call_path": ["run"]}
@@ -851,7 +851,7 @@ async def test_run_council_sandbox_create_failure_falls_back_to_host(
         llm,
         tools,
         db,
-        forum,
+        message_board,
         topic.id,
         str(_poc_checkout(tmp_path)),
         "finder",
@@ -879,7 +879,7 @@ async def test_run_council_host_path_without_containers(
 ) -> None:
     await _seed_agents(db)
     topic = await db.create_topic("audit")
-    forum = _forum(settings, db, logger)
+    message_board = _message_board(settings, db, logger)
     candidates = json.dumps(
         [
             {"file": "sample.c", "line": 6, "sink": "strcpy", "call_path": ["run"]}
@@ -899,7 +899,7 @@ async def test_run_council_host_path_without_containers(
         llm,
         tools,
         db,
-        forum,
+        message_board,
         topic.id,
         str(_poc_checkout(tmp_path)),
         "finder",

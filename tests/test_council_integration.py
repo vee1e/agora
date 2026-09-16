@@ -13,7 +13,7 @@ from harness.config import Settings
 from harness.containers import ContainerManager
 from harness.council.executor import CombinedTools, build_combined_tools
 from harness.db import Database
-from harness.forum import Forum
+from harness.message_board import MessageBoard
 from harness.llm import LLMResponse
 from harness.logging_ import EventLogger
 from harness.mailbox import Mailbox
@@ -121,7 +121,7 @@ def make_orch(
     tools: CombinedTools | None = None,
 ) -> Orchestrator:
     mailbox = Mailbox(db, logger=logger)
-    forum = Forum(db, mailbox, settings, logger=logger)
+    message_board = MessageBoard(db, mailbox, settings, logger=logger)
     return Orchestrator(
         settings,
         db,
@@ -131,7 +131,7 @@ def make_orch(
         BudgetGuard(db, settings, logger=logger),
         StateMachine(db, logger=logger),
         llm,
-        forum,
+        message_board,
         tools=tools,
     )
 

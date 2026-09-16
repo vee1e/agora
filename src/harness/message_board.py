@@ -1,6 +1,6 @@
-"""Append-only forum built on top of :mod:`harness.db`.
+"""Append-only message board built on top of :mod:`harness.db`.
 
-``Forum.post`` is the only write path for posts. Nothing here updates or
+``MessageBoard.post`` is the only write path for posts. Nothing here updates or
 deletes a post. All state lives in the database.
 """
 from __future__ import annotations
@@ -40,7 +40,7 @@ class PostResult:
     woken: list[str]
 
 
-class Forum:
+class MessageBoard:
     def __init__(
         self,
         db: Database,
@@ -109,7 +109,7 @@ class Forum:
         if post_id is None:
             recent = await self.db.count_posts_since(agent_id, window_start)
             self._log(
-                "forum_rate_limited",
+                "message_board_rate_limited",
                 agent_id=agent_id,
                 topic_id=topic_id,
                 recent=recent,
@@ -128,7 +128,7 @@ class Forum:
         woken = await self.mailbox.notify_subscribers(post, recipients)
 
         self._log(
-            "forum_post",
+            "message_board_post",
             agent_id=agent_id,
             topic_id=topic_id,
             post_id=post.id,
@@ -177,7 +177,7 @@ class Forum:
             await self.db.set_topic_owner(topic_id, from_agent)
             raise
         self._log(
-            "forum_handoff",
+            "message_board_handoff",
             topic_id=topic_id,
             from_agent=from_agent,
             to_agent=to_agent,

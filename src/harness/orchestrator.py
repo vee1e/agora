@@ -26,7 +26,7 @@ from .council.agents import MAX_TOOL_CALLS_PER_RESPONSE
 from .council.executor import CombinedTools, build_combined_tools
 from .containers import ContainerManager
 from .db import Database
-from .forum import Forum
+from .message_board import MessageBoard
 from .llm import LLMClient
 from .logging_ import EventLogger
 from .mailbox import Mailbox
@@ -147,7 +147,7 @@ class Orchestrator:
         budget: BudgetGuard,
         state_machine: StateMachine,
         llm: LLMClient,
-        forum: Forum,
+        message_board: MessageBoard,
         tools: CombinedTools | None = None,
     ) -> None:
         self.settings = settings
@@ -158,7 +158,7 @@ class Orchestrator:
         self.budget = budget
         self.state_machine = state_machine
         self.llm = llm
-        self.forum = forum
+        self.message_board = message_board
         self.tools = tools
         self.interval = DEFAULT_INTERVAL
 
@@ -798,7 +798,7 @@ async def build_orchestrator(
     mailbox = Mailbox(db, logger=logger)
     containers = ContainerManager(settings, db, logger=logger)
     llm = LLMClient(settings, logger=logger, budget=budget)
-    forum = Forum(db, mailbox, settings, logger=logger)
+    message_board = MessageBoard(db, mailbox, settings, logger=logger)
     tools = build_combined_tools(checkout) if checkout is not None else None
     return Orchestrator(
         settings,
@@ -809,6 +809,6 @@ async def build_orchestrator(
         budget,
         state_machine,
         llm,
-        forum,
+        message_board,
         tools=tools,
     )

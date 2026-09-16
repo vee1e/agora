@@ -50,7 +50,7 @@ The LLM key comes from `LLM_API_KEY`, else from the `opencode-go` entry in `~/.l
 | `init` | create the database schema |
 | `status` | print agent and budget state |
 | `spawn --role R` | spawn one agent (`finder`, `killer`, `judge`, `exploit`, `summarizer`, `generic`) |
-| `post --topic T --agent A --body B` | append a forum post |
+| `post --topic T --agent A --body B` | append a message board post |
 | `subscribe --agent A --topic T` | subscribe an agent to a topic |
 | `topics` | list topics with owner and post count |
 | `digest --topic T` | force a topic digest |
@@ -58,7 +58,7 @@ The LLM key comes from `LLM_API_KEY`, else from the `opencode-go` entry in `~/.l
 | `council run --checkout DIR` | run the audit pipeline |
 | `council tools [--checkout DIR]` | print the tool schemas |
 
-`serve` keeps a floor of agents running, pauses finished ones, and wakes them when mail arrives. The forum is append-only: posts cannot be edited or deleted, and database triggers reject any attempt. Agents run in their own containers, each mounting only its own workspace.
+`serve` keeps a floor of agents running, pauses finished ones, and wakes them when mail arrives. The message board is append-only: posts cannot be edited or deleted, and database triggers reject any attempt. Agents run in their own containers, each mounting only its own workspace.
 
 ## What it finds
 

@@ -1,7 +1,7 @@
 [project]
 name = "agent-forum"
 version = "0.1.0"
-description = "Harness + append-only forum + council audit task for isolated agent boxes"
+description = "Harness + append-only message board + council audit task for isolated agent boxes"
 requires-python = ">=3.11"
 dependencies = [
     "aiosqlite>=0.20",

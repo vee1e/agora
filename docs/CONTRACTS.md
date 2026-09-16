@@ -33,7 +33,7 @@ Method groups:
 - Containers: `upsert_container`, `set_container_status`, `get_container`, `list_containers`.
 - Mail: `send_mail`, `unread_mail`, `drain_mail`, `count_unread`, `mark_mail_read`.
 - Budget: `get_budget`, `add_tokens`, `add_tokens_many`.
-- Forum: `create_topic`, `topic_by_title`, `get_topic`, `list_topics`, `set_topic_owner`, `set_topic_owner_cas`, `bump_topic`, `set_topic_digest_mark`, `create_post`, `insert_post_limited`, `get_post`, `list_posts`, `list_posts_recent`, `count_posts_since`, `last_post_id`, `subscribe`, `unsubscribe`, `list_subscribers`, `list_subscriptions`, `add_digest`, `add_digest_and_mark`, `latest_digest`.
+- Message board: `create_topic`, `topic_by_title`, `get_topic`, `list_topics`, `set_topic_owner`, `set_topic_owner_cas`, `bump_topic`, `set_topic_digest_mark`, `create_post`, `insert_post_limited`, `get_post`, `list_posts`, `list_posts_recent`, `count_posts_since`, `last_post_id`, `subscribe`, `unsubscribe`, `list_subscribers`, `list_subscriptions`, `add_digest`, `add_digest_and_mark`, `latest_digest`.
 - Findings and PoCs: `create_finding`, `get_finding`, `list_findings`, `set_finding_status`, `add_poc_run`, `list_poc_runs`.
 
 ### `llm.py`
@@ -158,7 +158,7 @@ class StateMachine:
 
 Allowed: spawned to {running, waiting, dead}; running to {paused, waiting, dead}; paused to {waiting, running, dead}; waiting to {running, paused, dead}; dead to {}.
 
-### `forum.py`
+### `message_board.py`
 
 ```python
 class RateLimited(Exception): ...
@@ -170,7 +170,7 @@ class PostResult:
     post: m.Post
     woken: list[str]
 
-class Forum:
+class MessageBoard:
     def __init__(self, db, mailbox, settings, logger=None): ...
     async def ensure_topic(self, title, owner_id=None) -> m.Topic: ...
     async def subscribe(self, agent_id, topic_id) -> None: ...
@@ -394,7 +394,7 @@ The checkout is staged read-only at `/work/checkout`. The model writes a script,
 MAX_REVIEWED_DEFAULT = 25
 MAX_POCS_DEFAULT = 8
 
-async def run_council(llm, tools, db, forum, topic_id, checkout,
+async def run_council(llm, tools, db, message_board, topic_id, checkout,
                       finder_id, killer_id, judge_id, exploit_id,
                       logger=None, containers=None,
                       max_reviewed=None, max_pocs=None) -> CouncilResult: ...
