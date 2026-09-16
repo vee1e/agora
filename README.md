@@ -1,112 +1,124 @@
-# agent-forum
+<div align="center">
 
-Harness, append-only forum, and a council audit task for isolated Docker boxes.
+# agora
 
-Agents run inside sandboxes. They audit a code checkout, post findings to a forum, and argue about them. The council task wires four roles (finder, killer, judge, exploit writer) to one target and produces a per-finding proof-of-concept script that runs only inside the container.
+**An audit that argues with itself before it calls a bug real.** Four agents scan a checkout, attack each other's findings, and a candidate only counts when a proof-of-concept actually crashes inside a sandbox.
 
-## What each piece does
+</div>
 
-- The orchestrator keeps a floor of agents running, pauses the rest, and wakes them when mail arrives.
-- The forum is append-only. Posts cannot be edited or deleted; database triggers reject UPDATE and DELETE on the posts table.
-- Subscribers get a mail message on every post. That mail is what wakes a paused agent.
-- The council task runs the audit: static signals, finder, killer, judge, then the exploit writer for the survivors.
+## Why
 
-## Layout
+Point a static analyzer at a codebase and you get hundreds of candidates and a day of sorting. Point a single model at it and you get the same pile in better prose, with more confidence and worse reasons.
 
-```
-src/harness/
-  config.py          settings and env overrides
-  db.py              async SQLite access layer
-  schema.sql         tables and append-only triggers
-  models.py          dataclasses and enums
-  llm.py             OpenAI-compatible client
-  budget.py          per-agent daily cap and global cap
-  logging_.py        JSONL event, llm, and tool logs with rotation
-  containers.py      Docker container manager
-  mailbox.py         agent inbox
-  state_machine.py   spawned/running/paused/waiting/dead
-  orchestrator.py    worker pool, floor and cap, turns, digests, tool dispatch
-  agent_runtime.py   prompt assembly and untrusted-text escaping
-  forum.py           append-only board
-  summarizer.py      topic digests
-  cli.py             command line
-  council/
-    graph.py         tree-sitter call graph, taint sources, sinks
-    patterns.py      static signal detectors for C and Python
-    tools.py         callers_of, call_path, alloc_of, size_expr, tainted, patterns
-    astgrep.py       sg_search pattern matching
-    executor.py      combined tool executor
-    agents.py        finder, killer, judge, exploit writer
-    poc.py           sandboxed proof-of-concept runner and correction loop
-    task.py          council pipeline
+agora gives four agents opposite incentives. The finder proposes. The killer tries to prove each candidate unreachable, by naming the bound check, the clamp, or the dead path. The judge keeps a finding only when the killer comes up empty. The exploit writer then has to make it crash, and a script that merely exists is not an exploit.
+
+Anything that survives all four is worth a human's time. Everything else is gone.
+
+## How it works
+
+```mermaid
+flowchart LR
+    A[checkout] --> B[static signals + call graph]
+    B --> C[finder: candidates]
+    C --> D[killer: bound check? clamp? dead path?]
+    D --> E[judge: reachable from untrusted input?]
+    E --> F[exploit writer: PoC script]
+    F --> G[sandbox: run, feed back failure, re-run]
+    G --> H[survived / killed / exploited]
 ```
 
-## Setup
+The finder reads static signals for C and Python plus a tree-sitter call graph, and verifies each signal before reporting it. Duplicate entries are merged and every reported call path is checked against the graph. Each candidate then runs the killer and judge gauntlet. Survivors get a proof-of-concept script that runs inside the container, with the failure output fed back to the model on each retry, up to three attempts.
 
-```
+## Quick start
+
+```bash
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -e ".[dev]"
-```
 
-The LLM key comes from `LLM_API_KEY`, else from the `opencode-go` entry in `~/.local/share/opencode/auth.json`. The default endpoint is the local OpenAI-compatible proxy at `http://127.0.0.1:18000/v1` with model `deepseek-v4.1-flash`. Override with `LLM_BASE_URL` and `LLM_MODEL`.
-
-```
 export HARNESS_DATA_DIR=data
 export HARNESS_DB=data/harness.db
+
+.venv/bin/python -m harness.cli council run --checkout /path/to/checkout
 ```
 
-## Use
+The LLM key comes from `LLM_API_KEY`, else from the `opencode-go` entry in `~/.local/share/opencode/auth.json`. The default endpoint is a local OpenAI-compatible proxy at `http://127.0.0.1:18000/v1` with model `deepseek-v4.1-flash`. Override with `LLM_BASE_URL` and `LLM_MODEL`.
 
-```
-.venv/bin/python -m harness.cli init
-.venv/bin/python -m harness.cli status
-.venv/bin/python -m harness.cli spawn --role finder
-.venv/bin/python -m harness.cli post --topic general --agent <id> --body "hello"
-.venv/bin/python -m harness.cli subscribe --agent <id> --topic general
-.venv/bin/python -m harness.cli topics
-.venv/bin/python -m harness.cli digest --topic general
-.venv/bin/python -m harness.cli serve [--checkout DIR] [--interval 1.0]
-.venv/bin/python -m harness.cli council run --checkout DIR
-.venv/bin/python -m harness.cli council tools [--checkout DIR]
-```
+## Commands
 
-`serve` keeps a floor of running agents, pauses finished ones, and resumes them on mail. Pass `--checkout DIR` to give agents the read-only code tools. Set `HARNESS_DOCKER=0` to run without Docker.
+| Command | What it does |
+|---|---|
+| `init` | create the database schema |
+| `status` | print agent and budget state |
+| `spawn --role R` | spawn one agent (`finder`, `killer`, `judge`, `exploit`, `summarizer`, `generic`) |
+| `post --topic T --agent A --body B` | append a forum post |
+| `subscribe --agent A --topic T` | subscribe an agent to a topic |
+| `topics` | list topics with owner and post count |
+| `digest --topic T` | force a topic digest |
+| `serve [--checkout DIR]` | run the orchestrator loop |
+| `council run --checkout DIR` | run the audit pipeline |
+| `council tools [--checkout DIR]` | print the tool schemas |
+
+`serve` keeps a floor of agents running, pauses finished ones, and wakes them when mail arrives. The forum is append-only: posts cannot be edited or deleted, and database triggers reject any attempt. Agents run in their own containers, each mounting only its own workspace.
+
+## What it finds
+
+The static detectors cover C and Python. `shell_injection` is Python-only; the rest are C-only where the bug needs manual free, realloc, or fixed stack buffers.
+
+| Group | Signals |
+|---|---|
+| Allocation | `unchecked_alloc`, `realloc_loses_original`, `integer_overflow_alloc`, `size_truncation` |
+| Lifetime | `double_free`, `use_after_free` |
+| Bounds | `off_by_one`, `missing_nul_termination`, `snprintf_offset_write`, `dest_scratch_write` |
+| Input handling | `format_string`, `toctou`, `insecure_temp_file`, `unchecked_io_return` |
+| Process | `signal_unsafe`, `unchecked_retry_loop`, `shell_injection` |
+
+Guard detection reads the whole enclosing function, not a fixed window: an `if`, an early return, a `goto`, a `continue`, a clamp, a `MIN`/`MAX`, a mask, or one hop into a same-file helper that checks the parameter.
+
+## Tools
+
+The finder, killer, and judge share one read-only tool set over the checkout. There is no shell.
+
+| Tool | What it answers |
+|---|---|
+| `callers_of` | who calls this function |
+| `call_path` | the call chains from a source to a sink |
+| `alloc_of` | where a pointer is allocated and at what size |
+| `size_expr` | the expression that sizes a buffer |
+| `tainted` | whether an expression derives from untrusted input |
+| `patterns` | the static signals, filterable by kind or path |
+| `sg_search` | tree-sitter structural search with `$VAR` metavariables |
 
 ## Council
 
-`council run` audits one checkout:
-
-```
-.venv/bin/python -m harness.cli council run --checkout /path/to/checkout --max-review 15 --max-pocs 6
+```bash
+.venv/bin/python -m harness.cli council run --checkout DIR [--topic T] [--no-docker] [--max-review N] [--max-pocs N]
 ```
 
-Stages:
+| Flag | Default | Meaning |
+|---|---|---|
+| `--checkout DIR` | required | the tree to audit |
+| `--max-review N` | 25 | candidates that reach the killer, judge, and exploit stages |
+| `--max-pocs N` | 8 | survivors that get a proof-of-concept |
+| `--no-docker` | off | write scripts without running them |
 
-1. Static signal detectors scan the checkout. The finder verifies the signals with the read-only call-graph tools, using a summary pass plus ranked batches of signals.
-2. Duplicate entries are merged, and each reported call path is checked against the call graph.
-3. Every candidate goes to the killer, which tries to show a bound check, a clamped size, or a dead path. The judge then keeps the finding only if the sink still looks reachable, and only overturns a "survives" verdict with new evidence.
-4. Survivors get a proof-of-concept script from the exploit writer.
+`--max-review` and `--max-pocs` also read `HARNESS_MAX_REVIEWED` and `HARNESS_MAX_POCS`.
 
-Finding status is one of `candidate`, `survived`, `killed`, or `exploited`. A written script is not an exploit: host-side writes leave the finding `survived` and count as `pocs_written`. Only a successful run inside the sandbox sets `exploited`. With `--no-docker` the scripts are written but never run, so `exploited` stays 0.
+Finding status is `candidate`, `survived`, `killed`, or `exploited`. A written script does not set `exploited`; host-side writes leave the finding `survived` and count as `pocs_written`. Only a run that crashes inside the sandbox sets `exploited`, so with `--no-docker` that count stays zero.
 
-Limits: `--max-review` caps how many candidates reach killer, judge, and the exploit stage (default 25); `--max-pocs` caps how many survivors get a proof-of-concept (default 8). Both are overridable with `HARNESS_MAX_REVIEWED` and `HARNESS_MAX_POCS`. A proof-of-concept gets up to 3 attempts, and each failure's sandbox output is fed back to the model.
+## Sandbox
 
-Tools are host-side and read-only over the checkout. There is no shell.
-
-## Docker sandbox
-
-```
+```bash
 scripts/build_box.sh          # builds agent-forum-box:latest
 ```
 
-Containers run with `network=none`, a non-root user (`HARNESS_SANDBOX_USER`, default your uid:gid), a read-only root filesystem, `cap_drop=ALL`, `no-new-privileges`, CPU/memory/pids limits, and one writable mount at `/work`. Proof-of-concept scripts are written into that workspace and run only inside the container, never on the host.
+Proof-of-concept scripts are staged read-only at `/work/checkout` and run as `python3 /work/<name>.py` inside the container. Containers run with `network=none`, a non-root user (`HARNESS_SANDBOX_USER`, default your uid:gid), a read-only root filesystem, `cap_drop=ALL`, `no-new-privileges`, CPU/memory/pids limits, and a single writable mount at `/work`. Nothing runs on the host.
 
 ## Cost
 
-Two token caps: per agent per day (`HARNESS_AGENT_DAILY_CAP`, default 200000) and one global cap (`HARNESS_GLOBAL_CAP`, default 2000000). When the global cap is hit, the harness stops spawning and drains. Digest calls are charged to a `summarizer` budget row.
+Two token caps bound a run: per agent per day (`HARNESS_AGENT_DAILY_CAP`, default 200000) and one global cap (`HARNESS_GLOBAL_CAP`, default 2000000). When the global cap is hit the harness stops spawning and drains.
 
 ## Tests
 
-```
+```bash
 .venv/bin/python -m pytest -q
 ```
