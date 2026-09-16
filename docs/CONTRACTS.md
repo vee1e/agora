@@ -1,15 +1,43 @@
-# Interface contracts
+# Interfaces
 
-Fixed signatures. Do not rename anything here without updating this file.
-Already built (spine): `models.py`, `config.py`, `db.py`, `schema.sql`.
+Signatures and contracts for the harness. Update this file when one changes.
 
-Runtime LLM endpoint on this machine:
-- base URL `http://127.0.0.1:18000/v1` (OpenAI-compatible), model `deepseek-v4.1-flash`
-- key from `Settings.llm_api_key` (env `LLM_API_KEY`, else read from `~/.local/share/opencode/auth.json`)
+## Runtime LLM endpoint
 
-## Phase 1 modules
+- Base URL `http://127.0.0.1:18000/v1` (OpenAI-compatible), model `deepseek-v4.1-flash`.
+- Key comes from `Settings.llm_api_key`: `LLM_API_KEY`, else `OPENCODE_GO_API_KEY`, else the `opencode-go` entry in `~/.local/share/opencode/auth.json`.
+- Override with `LLM_BASE_URL` and `LLM_MODEL`.
 
-### `llm.py` (owner: builder-llm)
+## Core
+
+### `models.py`
+
+Enums:
+
+- `AgentState`: `spawned`, `running`, `paused`, `waiting`, `dead`.
+- `AgentRole`: `finder`, `killer`, `judge`, `exploit`, `summarizer`, `generic`.
+- `ContainerStatus`: `created`, `running`, `stopped`, `removed`.
+- `FindingStatus`: `candidate`, `survived`, `killed`, `exploited`.
+- `TurnState`: `running`, `done`, `failed`, `budget_exceeded`.
+
+Dataclasses include `Agent`, `Turn`, `Container`, `MailMessage`, `BudgetRow`, `Topic`, `Post`, `Digest`, `Finding`, `Usage`.
+
+### `db.py`
+
+`Database(path)`, then `await connect()`, `await init_schema()`, `await close()`. One `aiosqlite` connection, serialized through internal helpers.
+
+Method groups:
+
+- Agents: `create_agent`, `get_agent`, `list_agents`, `count_agents`, `set_agent_state`, `transition_state`, `set_agent_container`, `set_agent_context_path`, `set_agent_topic`, `touch_agent_wake`.
+- Turns: `start_turn`, `end_turn`, `get_turn`, `list_turns`, `running_turn`, `close_stale_turns`.
+- Containers: `upsert_container`, `set_container_status`, `get_container`, `list_containers`.
+- Mail: `send_mail`, `unread_mail`, `drain_mail`, `count_unread`, `mark_mail_read`.
+- Budget: `get_budget`, `add_tokens`, `add_tokens_many`.
+- Forum: `create_topic`, `topic_by_title`, `get_topic`, `list_topics`, `set_topic_owner`, `set_topic_owner_cas`, `bump_topic`, `set_topic_digest_mark`, `create_post`, `insert_post_limited`, `get_post`, `list_posts`, `list_posts_recent`, `count_posts_since`, `last_post_id`, `subscribe`, `unsubscribe`, `list_subscribers`, `list_subscriptions`, `add_digest`, `add_digest_and_mark`, `latest_digest`.
+- Findings and PoCs: `create_finding`, `get_finding`, `list_findings`, `set_finding_status`, `add_poc_run`, `list_poc_runs`.
+
+### `llm.py`
+
 ```python
 class LLMError(Exception): ...
 class LLMBudgetError(LLMError): ...
@@ -24,63 +52,58 @@ class LLMResponse:
     raw: dict = field(default_factory=dict)
 
 class LLMClient:
-    def __init__(self, settings: Settings, logger: EventLogger | None = None,
-                 budget: BudgetGuard | None = None, agent_id: str | None = None): ...
-    async def complete(
-        self,
-        messages: list[dict],
-        tools: list[dict] | None = None,
-        max_tokens: int | None = None,
-        temperature: float | None = None,
-        agent_id: str | None = None,
-        response_format: dict | None = None,
-    ) -> LLMResponse: ...
+    def __init__(self, settings, logger=None, budget=None, agent_id=None): ...
+    async def complete(self, messages, tools=None, max_tokens=None,
+                       temperature=None, agent_id=None,
+                       response_format=None) -> LLMResponse: ...
     async def aclose(self) -> None: ...
 ```
-- POSTs to `{llm_base_url}/chat/completions`.
-- Reads `choices[0].message.content` and `choices[0].message.tool_calls`;
-  usage from `usage.prompt_tokens` / `usage.completion_tokens`.
-- Calls `budget.check_agent()` before the request and `budget.record()` after.
-- Logs every call through `EventLogger.llm_call`.
-- Uses `httpx.AsyncClient` with a 120s timeout; retries once on 429/5xx.
 
-### `budget.py` (owner: builder-llm)
+- POSTs to `{llm_base_url}/chat/completions`.
+- Reads `choices[0].message.content`, `choices[0].message.tool_calls`, and `usage`.
+- Calls `budget.check_agent()` before the request and `budget.record()` after.
+- Logs each call through `EventLogger.llm_call`.
+- `httpx.AsyncClient`, 120s timeout, one retry on 429 and 5xx.
+
+### `budget.py`
+
 ```python
 class BudgetExceeded(Exception): ...
 
 class BudgetGuard:
-    def __init__(self, db: Database, settings: Settings, logger: EventLogger | None = None): ...
+    def __init__(self, db, settings, logger=None): ...
     @staticmethod
     def today() -> str: ...                 # UTC date, "YYYY-MM-DD"
-    async def agent_used(self, agent_id: str) -> int: ...
+    async def agent_used(self, agent_id) -> int: ...
     async def global_used(self) -> int: ...
-    async def check_agent(self, agent_id: str) -> None: ...   # raises BudgetExceeded
-    async def check_global(self) -> None: ...                 # raises BudgetExceeded
-    async def can_spawn(self) -> bool: ...                    # False when global spent >= global cap
-    async def record(self, agent_id: str, tokens: int) -> None: ...
+    async def check_agent(self, agent_id) -> None: ...   # raises BudgetExceeded
+    async def check_global(self) -> None: ...            # raises BudgetExceeded
+    async def can_spawn(self) -> bool: ...
+    async def record(self, agent_id, tokens) -> None: ...
     async def remaining_global(self) -> int: ...
 ```
-- Two `budget` rows per day per agent: one `scope="agent"` keyed by agent id, one
-  `scope="global"` keyed `"global"`. `record` updates both.
 
-### `logging_.py` (owner: builder-llm)
+Two `budget` rows per day per agent: one `scope="agent"` keyed by agent id, one `scope="global"` keyed `"global"`. `record` updates both.
+
+### `logging_.py`
+
 ```python
 class EventLogger:
-    def __init__(self, log_dir: Path, agent_id: str | None = None): ...
-    def event(self, kind: str, **fields: Any) -> None: ...
-    def llm_call(self, *, agent_id: str | None, model: str, tokens_in: int,
-                 tokens_out: int, latency_ms: int, error: str | None = None,
-                 note: str | None = None) -> None: ...
-    def tool_call(self, *, agent_id: str | None, name: str, args: Any,
-                  result: Any = None, error: str | None = None,
-                  latency_ms: int | None = None) -> None: ...
+    def __init__(self, log_dir, agent_id=None, max_bytes=DEFAULT_LOG_MAX_BYTES): ...
+    def event(self, kind, **fields) -> None: ...
+    def llm_call(self, *, agent_id, model, tokens_in, tokens_out,
+                 latency_ms, error=None, note=None) -> None: ...
+    def tool_call(self, *, agent_id, name, args, result=None,
+                  error=None, latency_ms=None) -> None: ...
     def close(self) -> None: ...
 ```
-- Appends one JSON object per line to `<log_dir>/llm.jsonl`, `<log_dir>/tools.jsonl`,
-  `<log_dir>/events.jsonl`. Creates dirs. Never raises on a bad payload (log to stderr).
-- Safe to share across tasks; each `log()` opens, appends, closes.
 
-### `containers.py` (owner: builder-runtime)
+Appends one JSON object per line to `<log_dir>/llm.jsonl`, `<log_dir>/tools.jsonl`, and `<log_dir>/events.jsonl`. Rotates at `max_bytes`. Never raises on a bad payload.
+
+## Runtime
+
+### `containers.py`
+
 ```python
 @dataclass
 class ExecResult:
@@ -89,103 +112,54 @@ class ExecResult:
     stderr: str
 
 class ContainerManager:
-    def __init__(self, settings: Settings, db: Database, logger: EventLogger | None = None): ...
-    def workspace_for(self, agent_id: str) -> Path: ...
-    async def create(self, agent_id: str, image: str | None = None) -> m.Container: ...
-    async def start(self, container_id: str) -> None: ...
-    async def stop(self, container_id: str, timeout: int = 10) -> None: ...
-    async def remove(self, container_id: str) -> None: ...
-    async def exec(self, container_id: str, argv: list[str], timeout: int = 60) -> ExecResult: ...
-    async def status(self, container_id: str) -> m.ContainerStatus: ...
+    def __init__(self, settings, db, logger=None): ...
+    def workspace_for(self, agent_id) -> Path: ...   # absolute, resolved
+    async def create(self, agent_id, image=None) -> m.Container: ...
+    async def start(self, container_id) -> None: ...
+    async def stop(self, container_id, timeout=10) -> None: ...
+    async def remove(self, container_id) -> None: ...
+    async def exec(self, container_id, argv, timeout=60) -> ExecResult: ...
+    async def status(self, container_id) -> m.ContainerStatus: ...
     async def aclose(self) -> None: ...
 ```
-- Docker SDK used inside `asyncio.to_thread`; never block the loop.
-- Hardening: `network_mode=settings.sandbox_network` (`none` by default),
-  `cap_drop=["ALL"]`, `security_opt=["no-new-privileges"]`, `pids_limit=256`,
-  `mem_limit="1g"`, workspace bind-mounted at `/work`.
-- When `settings.docker_enabled` is False: no Docker calls, container id is
-  `fake-<agent_id>`, `status` returns `RUNNING`, rows still written to `containers`.
 
-### `mailbox.py` (owner: builder-runtime)
+- The Docker SDK runs inside `asyncio.to_thread`.
+- Hardening: `network_mode=settings.sandbox_network` (`none` by default), `cap_drop=["ALL"]`, `security_opt=["no-new-privileges"]`, `pids_limit=256`, `mem_limit="1g"`, `read_only=True`, a `64m` tmpfs at `/tmp`, and the workspace bind-mounted at `/work`.
+- When `settings.docker_enabled` is False: no Docker calls, the container id is `fake-<agent_id>`, `status` returns `RUNNING`, and rows are still written to `containers`.
+
+### `mailbox.py`
+
 ```python
 class Mailbox:
-    def __init__(self, db: Database, logger: EventLogger | None = None): ...
-    async def send(self, agent_id: str, body: str, sender_id: str | None = None,
-                   topic_id: str | None = None, post_id: int | None = None) -> m.MailMessage: ...
-    async def drain(self, agent_id: str) -> list[m.MailMessage]: ...   # unread, then marks read
-    async def has_unread(self, agent_id: str) -> bool: ...
-    async def notify_subscribers(self, post: m.Post, subscribers: list[str]) -> list[str]: ...
+    def __init__(self, db, logger=None): ...
+    async def send(self, agent_id, body, sender_id=None,
+                   topic_id=None, post_id=None) -> m.MailMessage: ...
+    async def drain(self, agent_id) -> list[m.MailMessage]: ...
+    async def has_unread(self, agent_id) -> bool: ...
+    async def notify_subscribers(self, post, subscribers) -> list[str]: ...
 ```
-- `notify_subscribers` sends mail to every subscriber except `post.agent_id`,
-  returns the recipients.
 
-### `state_machine.py` (owner: builder-runtime)
+`notify_subscribers` mails every subscriber except the author and returns the recipients.
+
+### `state_machine.py`
+
 ```python
 class InvalidTransition(Exception): ...
 
 class StateMachine:
     ALLOWED: ClassVar[dict[m.AgentState, set[m.AgentState]]]
-    def __init__(self, db: Database, logger: EventLogger | None = None): ...
+    def __init__(self, db, logger=None): ...
     @staticmethod
-    def can_transition(src: m.AgentState, dst: m.AgentState) -> bool: ...
+    def can_transition(src, dst) -> bool: ...
     @staticmethod
     def initial() -> m.AgentState: ...     # SPAWNED
-    async def transition(self, agent_id: str, dst: m.AgentState,
-                         reason: str | None = None) -> m.Agent: ...
+    async def transition(self, agent_id, dst, reason=None) -> m.Agent: ...
 ```
-Allowed: spawned to {running, waiting, dead}; running to {paused, waiting, dead};
-paused to {waiting, running, dead}; waiting to {running, paused, dead}; dead to {}.
 
-### `orchestrator.py` + `runtime.py` (owner: builder-orchestrator)
-```python
-class Orchestrator:
-    def __init__(self, settings: Settings, db: Database, logger: EventLogger,
-                 containers: ContainerManager, mailbox: Mailbox, budget: BudgetGuard,
-                 state_machine: StateMachine, llm: LLMClient): ...
-    async def start(self) -> None: ...
-    async def stop(self) -> None: ...
-    async def tick(self) -> None: ...          # one reconcile pass; used by tests
-    async def run_forever(self, interval: float = 1.0) -> None: ...
-    async def spawn_agent(self, role: m.AgentRole) -> m.Agent: ...
-    async def request_wake(self, agent_id: str) -> None: ...
-    async def run_turn(self, agent_id: str) -> None: ...
-```
-Rules:
-- Floor `settings.floor` running, cap `settings.hard_cap`. Spawn only when running
-  is below the floor and `budget.can_spawn()`.
-- More than `hard_cap` agents go to `WAITING`; they enter when a slot frees.
-- `run_turn` runs a bounded loop: log a `turns` row, call the LLM until
-  `settings.turn_token_budget` for that turn is spent or the model stops,
-  then save context to `settings.workspace_dir/<agent_id>/context.json`,
-  stop the container, and set the agent `PAUSED`.
-- Wake on mail: `request_wake` moves a paused/waiting agent to running if a slot
-  is free, else waiting.
-- Worker pool of `settings.worker_pool_size` asyncio workers pulling from a queue.
+Allowed: spawned to {running, waiting, dead}; running to {paused, waiting, dead}; paused to {waiting, running, dead}; waiting to {running, paused, dead}; dead to {}.
 
-### `cli.py` (owner: builder-orchestrator)
-```python
-def main(argv: list[str] | None = None) -> int: ...
-```
-Commands: `init`, `serve`, `status`, `spawn --role R`, `post --topic T --body B --agent A`.
-`async def build_orchestrator(settings) -> Orchestrator` wires everything and
-`init` creates schema. Must run with `python -m harness.cli`.
+### `forum.py`
 
-### `agent_runtime.py` (owner: builder-orchestrator)
-A `TurnContext` that builds the message list from forum state. Phase 1 ships a
-stub `build_messages(agent, unread, topic_posts) -> list[dict]` that returns a
-system prompt plus the unread mail as user turns. Phase 3 replaces the body.
-
-## Phase 2 modules
-
-Board rules from plan.md: append-only (no edits, no deletes), post fields
-`agent_id, time, topic, parent_id, body, refs`, subscribers woken by a post,
-rate limit per agent per hour, one owner per topic, ownership passes only on a
-stated handoff, summarizer digest every N posts, no state outside the DB.
-
-Append-only is enforced in `schema.sql` by triggers `posts_append_only_update`
-and `posts_append_only_delete`; any UPDATE/DELETE on `posts` raises.
-
-### `forum.py` (owner: builder-forum)
 ```python
 class RateLimited(Exception): ...
 class NotTopicOwner(Exception): ...
@@ -194,58 +168,72 @@ class InvalidPost(Exception): ...
 @dataclass
 class PostResult:
     post: m.Post
-    woken: list[str]          # subscribers mailed, author excluded
+    woken: list[str]
 
 class Forum:
-    def __init__(self, db: Database, mailbox: Mailbox, settings: Settings,
-                 logger: EventLogger | None = None): ...
-    async def ensure_topic(self, title: str, owner_id: str | None = None) -> m.Topic: ...
-    async def subscribe(self, agent_id: str, topic_id: str) -> None: ...
-    async def unsubscribe(self, agent_id: str, topic_id: str) -> None: ...
-    async def subscribers(self, topic_id: str) -> list[str]: ...
-    async def owner_id(self, topic_id: str) -> str | None: ...
-    async def post(self, agent_id: str, topic_id: str, body: str,
-                   parent_id: int | None = None,
-                   refs: list[dict] | None = None) -> PostResult: ...
-    async def read(self, topic_id: str, since_id: int = 0, limit: int = 100) -> list[m.Post]: ...
-    async def handoff(self, topic_id: str, from_agent: str, to_agent: str,
-                      note: str = "") -> PostResult: ...
+    def __init__(self, db, mailbox, settings, logger=None): ...
+    async def ensure_topic(self, title, owner_id=None) -> m.Topic: ...
+    async def subscribe(self, agent_id, topic_id) -> None: ...
+    async def unsubscribe(self, agent_id, topic_id) -> None: ...
+    async def subscribers(self, topic_id) -> list[str]: ...
+    async def owner_id(self, topic_id) -> str | None: ...
+    async def post(self, agent_id, topic_id, body,
+                   parent_id=None, refs=None) -> PostResult: ...
+    async def read(self, topic_id, since_id=0, limit=100) -> list[m.Post]: ...
+    async def handoff(self, topic_id, from_agent, to_agent, note="") -> PostResult: ...
 ```
-- `post` validates: agent exists, topic exists, body length 1..`MAX_POST_CHARS`
-  (8000), `parent_id` (when set) points at a post in the same topic, `refs` is a
-  list of dicts with string keys. Bad input raises `InvalidPost`.
-- `post` enforces the rate limit with `db.count_posts_since(agent_id, now-3600)`
-  against `settings.posts_per_agent_per_hour`; at/over the limit raises `RateLimited`.
-- `post` is the only write path. It inserts, bumps the topic, mails every
-  subscriber except the author via `mailbox.notify_subscribers`, and returns
-  `PostResult(post, woken)`. No in-memory state is kept anywhere.
-- `handoff` raises `NotTopicOwner` unless `from_agent` is the current owner.
-  On success it moves ownership and posts a short handoff message.
+
+- `post` validates: agent exists, topic exists, body length 1..`MAX_POST_CHARS` (8000), `parent_id` (when set) points at a post in the same topic, and `refs` is a list of dicts with string keys. Bad input raises `InvalidPost`.
+- `post` enforces the rate limit with `db.count_posts_since(agent_id, now-3600)` against `settings.posts_per_agent_per_hour`; at or over the limit it raises `RateLimited`.
+- `post` is the only write path. It inserts, bumps the topic, mails every subscriber except the author, and returns `PostResult`. No state is kept outside the database.
+- `handoff` raises `NotTopicOwner` unless `from_agent` is the current owner, then moves ownership and posts a short handoff message.
 - `ensure_topic` is idempotent by title.
 
-### `summarizer.py` (owner: builder-summarizer)
+### `summarizer.py`
+
 ```python
 DIGEST_SYSTEM_PROMPT: str
 
-async def summarize_topic(db: Database, llm: LLMClient, topic_id: str,
-                          every_n: int = 25, force: bool = False,
-                          logger: EventLogger | None = None) -> dict | None: ...
+async def summarize_topic(db, llm, topic_id, every_n=25, force=False,
+                          logger=None) -> dict | None: ...
 ```
-- Reads posts after `topics.last_digest_post_id`. If fewer than `every_n` new
-  posts and not `force`, returns `None`.
-- Calls `llm.complete` with `DIGEST_SYSTEM_PROMPT` and the new posts, asks for a
-  short plain-text digest (hard cap 1500 chars, truncated if longer).
-- Stores it with `db.add_digest` and advances `db.set_topic_digest_mark`.
-- Returns `{"topic_id", "from_post_id", "to_post_id", "body"}`.
-- No tools, no container, pure text.
 
-## Phase 3 modules: council
+Reads posts after `topics.last_digest_post_id`. With fewer than `every_n` new posts and not `force`, returns `None`. Otherwise asks the model for a plain-text digest (hard cap 1500 chars), stores it with `db.add_digest`, and advances the mark. Returns `{"topic_id", "from_post_id", "to_post_id", "body"}`. No tools and no container.
 
-Council is the audit job (plan.md Part 3). Tools are host-side, read-only over a
-checkout, no shell. Exploit scripts are written into the sandboxed container
-workspace. No payloads and no crash inputs are produced, only reports.
+### `orchestrator.py` and `agent_runtime.py`
 
-### `council/graph.py` (owner: builder-graph)
+```python
+class Orchestrator:
+    def __init__(self, settings, db, logger, containers, mailbox, budget,
+                 state_machine, llm): ...
+    async def start(self) -> None: ...
+    async def stop(self) -> None: ...
+    async def tick(self) -> None: ...          # one reconcile pass; used by tests
+    async def run_forever(self, interval=1.0) -> None: ...
+    async def spawn_agent(self, role) -> m.Agent: ...
+    async def request_wake(self, agent_id) -> None: ...
+    async def run_turn(self, agent_id) -> None: ...
+
+async def build_orchestrator(settings, checkout=None) -> Orchestrator: ...
+```
+
+Rules:
+
+- Floor `settings.floor`, cap `settings.hard_cap`. Spawn only when running is below the floor and `budget.can_spawn()`.
+- Agents beyond `hard_cap` go to `WAITING` and enter when a slot frees.
+- `run_turn` logs a `turns` row, calls the model until `settings.turn_token_budget` is spent or the model stops (bounded by `MAX_LLM_CALLS = 8`), writes context to `settings.workspace_dir/<agent_id>/context.json`, stops the container, and sets the agent `PAUSED`.
+- Wake on mail: `request_wake` moves a paused or waiting agent to running if a slot is free, else waiting.
+- A pool of `settings.worker_pool_size` workers pulls from an asyncio queue.
+- `agent_runtime` assembles prompts (`build_messages`), escapes untrusted text, and exposes `tool_specs(tools=None)`, which returns `tools.specs()` when a tool executor is supplied, else `[]`.
+
+### `cli.py`
+
+Commands: `init`, `status`, `spawn --role R`, `post --topic T --body B --agent A`, `subscribe --agent A --topic T`, `topics`, `digest --topic T`, `serve [--interval S] [--checkout DIR]`, `council run --checkout DIR [--topic T] [--no-docker] [--max-review N] [--max-pocs N]`, `council tools [--checkout DIR]`. Runs as `python -m harness.cli`.
+
+## Council
+
+### `council/graph.py`
+
 ```python
 @dataclass
 class Alloc:
@@ -257,7 +245,7 @@ class BufferSize:
 
 @dataclass
 class TaintSource:
-    name: str; line: int; kind: str        # read/recv/getenv/argv/fgets/input
+    name: str; line: int; kind: str
 
 @dataclass
 class Sink:
@@ -280,37 +268,41 @@ class CodeGraph:
     def files(self) -> list[str]: ...
     @property
     def functions(self) -> dict[str, list[Function]]: ...
-    def callers_of(self, fn: str) -> list[tuple[Function, int]]: ...
-    def call_path(self, source: str, sink: str, max_depth: int = 8,
-                  max_paths: int = 20) -> list[list[str]]: ...
-    def alloc_of(self, fn: str, ptr: str | None = None) -> list[Alloc]: ...
-    def size_expr(self, fn: str, buf: str) -> list[BufferSize]: ...
-    def tainted(self, fn: str, expr: str) -> bool: ...
+    @property
+    def signals(self) -> list[Signal]: ...
+    def callers_of(self, fn) -> list[tuple[Function, int]]: ...
+    def call_path(self, source, sink, max_depth=8, max_paths=20) -> list[list[str]]: ...
+    def alloc_of(self, fn, ptr=None) -> list[Alloc]: ...
+    def size_expr(self, fn, buf) -> list[BufferSize]: ...
+    def tainted(self, fn, expr) -> bool: ...
     def to_dict(self) -> dict: ...
 ```
-- Parses `.c/.h` with tree-sitter C and `.py` with tree-sitter Python.
-- `call_path` returns distinct call chains from the function named `source` to the
-  one named `sink`, capped by depth and count.
-- `tainted(fn, expr)` is True when the expression is assigned from or derived
-  from a taint source in that function.
-- Never executes checkout code. Read-only.
 
-### `council/tools.py` (owner: builder-graph)
+Parses `.c` and `.h` with tree-sitter C and `.py` with tree-sitter Python. `signals` holds the static signals found during `build`. Never executes checkout code.
+
+### `council/patterns.py`
+
+Static detectors. `Signal` is a frozen dataclass `{kind, file, line, function, detail, cwe, confidence}`. Kinds include `unchecked_alloc`, `realloc_loses_original`, `double_free`, `use_after_free`, `integer_overflow_alloc`, `size_truncation`, `off_by_one`, `format_string`, `missing_nul_termination`, `unchecked_io_return`, `signal_unsafe`, `dest_scratch_write`, `snprintf_offset_write`, `toctou`, `insecure_temp_file`, `unchecked_retry_loop`, and `shell_injection`. Some kinds are C-only; `shell_injection` covers Python. Guard detection scans the whole enclosing function: an `if`, an early return, `goto`, `continue`, a clamp, a `MIN`/`MAX`, a mask, or one hop into a same-file helper that checks the parameter.
+
+### `council/tools.py`
+
 ```python
 class CouncilTools:
     def __init__(self, graph: CodeGraph): ...
-    def specs(self) -> list[dict]: ...                  # OpenAI tool schemas
-    def dispatch(self, name: str, arguments: dict) -> dict: ...
-    def callers_of(self, fn: str) -> dict: ...
-    def call_path(self, source: str, sink: str) -> dict: ...
-    def alloc_of(self, ptr: str, fn: str | None = None) -> dict: ...
-    def size_expr(self, buf: str, fn: str | None = None) -> dict: ...
-    def tainted(self, expr: str, fn: str | None = None) -> dict: ...
+    def specs(self) -> list[dict]: ...
+    def dispatch(self, name, arguments) -> dict: ...
+    def callers_of(self, fn) -> dict: ...
+    def call_path(self, source, sink) -> dict: ...
+    def alloc_of(self, ptr, fn=None) -> dict: ...
+    def size_expr(self, buf, fn=None) -> dict: ...
+    def tainted(self, expr, fn=None) -> dict: ...
+    def patterns(self, kind=None, path=None, limit=100) -> dict: ...
 ```
-- Tool names: `callers_of`, `call_path`, `alloc_of`, `size_expr`, `tainted`.
-- `dispatch` validates arguments, never shells out, returns `{"ok": bool, ...}`.
 
-### `council/astgrep.py` (owner: builder-astgrep)
+Tool names: `callers_of`, `call_path`, `alloc_of`, `size_expr`, `tainted`, `patterns`. `dispatch` validates arguments and returns `{"ok": bool, ...}`. No shell.
+
+### `council/astgrep.py`
+
 ```python
 @dataclass
 class Match:
@@ -319,19 +311,18 @@ class Match:
 
 class AstGrep:
     def __init__(self, root: Path): ...
-    def search(self, pattern: str, lang: str | None = None,
-               path: str | None = None, limit: int = 200) -> list[Match]: ...
+    def search(self, pattern, lang=None, path=None, limit=200) -> list[Match]: ...
     def specs(self) -> list[dict]: ...
-    def dispatch(self, name: str, arguments: dict) -> dict: ...
+    def dispatch(self, name, arguments) -> dict: ...
 ```
-- Tool name: `sg_search`. Pattern language supports `$VAR` metavariables
-  (converted to tree-sitter query captures) and plain-literal fallback.
-- Tree-sitter only; if the `ast-grep` binary is absent, behavior is unchanged.
-- Read-only over the checkout, never executes code.
 
-### `council/agents.py` + `council/task.py` (owner: builder-council)
+Tool name: `sg_search`. Patterns support `$VAR` metavariables, converted to tree-sitter query captures, with a plain-literal fallback. Read-only.
+
+### `council/agents.py`
+
 ```python
 FINDER_PROMPT: str
+FINDER_TRIAGE_PROMPT: str
 KILLER_PROMPT: str
 JUDGE_PROMPT: str
 EXPLOIT_PROMPT: str
@@ -343,44 +334,85 @@ class CouncilResult:
     survived: int
     killed: int
     exploited: int
-    precision: float                 # survived / (survived + killed)
+    precision: float
     findings: list[m.Finding]
     notes: list[str]
 
-async def run_tool_agent(llm, tools, system_prompt: str, task_prompt: str,
-                         agent_id: str, max_calls: int = 8) -> dict: ...
+async def run_tool_agent(llm, tools, system_prompt, task_prompt, agent_id,
+                         max_calls=8, temperature=None, logger=None) -> dict: ...
 
-async def finder_audit(llm, tools, db, topic_id: str, agent_id: str,
-                       checkout: str) -> list[m.Finding]: ...
+async def finder_audit(llm, tools, db, topic_id, agent_id, checkout,
+                       logger=None) -> list[m.Finding]: ...
 
-async def killer_refute(llm, tools, db, finding: m.Finding,
-                        agent_id: str) -> m.FindingStatus: ...
+async def killer_refute(llm, tools, db, finding, agent_id,
+                        logger=None) -> KillerVerdict: ...
 
-async def judge_review(llm, tools, db, finding: m.Finding,
-                       agent_id: str) -> m.FindingStatus: ...
+async def judge_review(llm, tools, db, finding, agent_id,
+                       killer_reason=None, logger=None) -> m.FindingStatus: ...
 
-async def write_exploit(llm, tools, db, finding: m.Finding,
-                        workspace: Path, agent_id: str) -> str | None: ...
-
-async def run_council(llm, tools, db, forum, topic_id: str, checkout: str,
-                      finder_id: str, killer_id: str, judge_id: str,
-                      exploit_id: str) -> CouncilResult: ...
+async def write_exploit(llm, tools, db, finding, workspace, agent_id,
+                        logger=None) -> str | None: ...
 ```
-- Finder posts a finding per candidate via `db.create_finding` and appends a forum
-  post with file, line, sink and call path.
-- Killer tries to break it (bound check, clamped size, dead path); judge keeps it
-  only if the path survives. `FindingStatus` moves candidate -> survived|killed.
-- Exploit writer writes a PoC script into `workspace` (sandboxed) and never runs
-  it on the host. Grouped notes (one input reaching two sinks on one path) are
-  report-only text, no payloads, no crash inputs.
-- `precision = survived / max(1, survived + killed)`.
 
-### Integration (owner: builder-council-integration)
-- `agent_runtime.tool_specs(tools=None)` returns `tools.specs()` when a tool
-  executor is supplied, else `[]`.
-- `orchestrator.run_turn` dispatches `response.tool_calls` through a tool executor
-  and feeds results back as `role="tool"` messages, still bounded by
-  `MAX_LLM_CALLS` and the turn budget. A response with no tool calls ends the turn.
-- The finder returns candidates to `run_council`, which creates the findings in
-  the database and posts the announce messages to the forum.
-- CLI: `council run --checkout DIR`, `council tools`.
+- The finder runs a summary pass, then up to 8 triage batches of 12 ranked signals each (cap 96 signals). Entries are deduped and validated: the file must be in the graph, the sink must be a known sink or a matching signal kind, and each call path edge is checked against the graph (an unconfirmed path is kept and marked).
+- The killer tries to break a finding (bound check, clamped size, dead path). The judge keeps it only if the path still looks reachable, and only overturns a "survives" verdict with new evidence.
+- `write_exploit` writes a script into the sandbox workspace and never runs it on the host. It refuses an invalid id, an oversized body, or a symlinked path.
+- `precision = survived / max(1, survived + killed)`.
+- The result also carries `reviewed`, `pending`, `pocs_run`, `pocs_succeeded`, `pocs_written`, `pocs_capped`, and `sandbox_ran`, used by the CLI summary.
+
+### `council/poc.py`
+
+```python
+SUCCESS_MARKER = "POC_SUCCESS"
+POC_MAX_ATTEMPTS = 3
+
+@dataclass
+class PocAttempt:
+    attempt: int; script: str; exit_code: int
+    stdout: str; stderr: str; success: bool; duration_ms: int = 0
+
+@dataclass
+class PocResult:
+    finding_id: str; success: bool
+    attempts: list[PocAttempt] = field(default_factory=list)
+    script_path: str | None = None
+    reason: str | None = None
+
+def stage_checkout(checkout, workspace) -> Path: ...
+
+async def run_and_correct_poc(llm, db, containers, container_id, finding,
+                              checkout, workspace, agent_id,
+                              max_attempts=POC_MAX_ATTEMPTS,
+                              logger=None) -> PocResult: ...
+```
+
+The checkout is staged read-only at `/work/checkout`. The model writes a script, the sandbox runs `python3 /work/<name>.py`, and on failure the output is fed back for a rewrite, up to `max_attempts`. A run succeeds only when the exit code is 0 and `POC_SUCCESS` is on stdout. Nothing runs on the host.
+
+### `council/task.py`
+
+```python
+MAX_REVIEWED_DEFAULT = 25
+MAX_POCS_DEFAULT = 8
+
+async def run_council(llm, tools, db, forum, topic_id, checkout,
+                      finder_id, killer_id, judge_id, exploit_id,
+                      logger=None, containers=None,
+                      max_reviewed=None, max_pocs=None) -> CouncilResult: ...
+```
+
+Pipeline: subscribe the four agents, run the finder, announce the candidates, then run killer and judge per candidate up to `max_reviewed` (default 25, env `HARNESS_MAX_REVIEWED`). Survivors beyond that cap stay `candidate`. For the first `max_pocs` survivors (default 8, env `HARNESS_MAX_POCS`), if Docker is enabled, one container is created for the whole pass, each PoC is run inside it, and a success sets the finding `exploited`, then the container is removed. If Docker is disabled or `--no-docker` is set, the scripts are written host-side, the finding stays `survived`, and the count is reported as `pocs_written`.
+
+### `council/executor.py`
+
+```python
+class CombinedTools:
+    def __init__(self, council: CouncilTools, astgrep: AstGrep): ...
+    @property
+    def graph(self) -> CodeGraph | None: ...
+    def specs(self) -> list[dict]: ...
+    def dispatch(self, name, arguments) -> dict: ...
+
+def build_combined_tools(checkout) -> CombinedTools: ...
+```
+
+Unions the council tools and `sg_search` behind one `specs`/`dispatch` surface and builds the code graph once.
