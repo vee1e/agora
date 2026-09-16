@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+data/
+*.db
+*.db-wal
+*.db-shm
+.pytest_cache/
+
+# Vendored audit targets and generated audit output: kept locally, not published
+oss/
+report/
+~/
