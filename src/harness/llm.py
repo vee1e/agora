@@ -22,6 +22,7 @@ DEFAULT_TIMEOUT = 120.0
 DEFAULT_TEMPERATURE = 0.7
 MAX_ATTEMPTS = 3
 RETRY_BACKOFF_BASE = 0.5
+MAX_RETRY_AFTER_SECONDS = 60.0
 ERROR_BODY_LIMIT = 2000
 
 
@@ -160,21 +161,20 @@ class LLMClient:
 
         usage_raw = data.get("usage")
         usage_missing = not isinstance(usage_raw, dict)
-        if usage_missing:
-            usage = m.Usage()
-        else:
-            usage = m.Usage(
-                tokens_in=int(usage_raw.get("prompt_tokens") or 0),
-                tokens_out=int(usage_raw.get("completion_tokens") or 0),
-            )
         model = data.get("model") or self.settings.llm_model
+        if usage_missing:
+            last_error = "usage missing from provider response"
+            self._log_llm(resolved_agent, 0, 0, started, error=last_error, note="usage missing", model=model)
+            raise LLMError(last_error)
+        usage = m.Usage(
+            tokens_in=int(usage_raw.get("prompt_tokens") or 0),
+            tokens_out=int(usage_raw.get("completion_tokens") or 0),
+        )
 
         if self.budget is not None and resolved_agent is not None:
             await self.budget.record(resolved_agent, usage.total)
 
         notes: list[str] = []
-        if usage_missing:
-            notes.append("usage missing")
         if finish_reason:
             notes.append(str(finish_reason))
         note = "; ".join(notes) if notes else None
@@ -236,7 +236,7 @@ class LLMClient:
             except (TypeError, ValueError):
                 requested = None
             if requested is not None and requested > delay:
-                delay = requested
+                delay = min(requested, MAX_RETRY_AFTER_SECONDS)
         await asyncio.sleep(delay)
 
     def _log_llm(

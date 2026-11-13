@@ -426,8 +426,9 @@ def test_decorated_and_nested_python_defs_collected(tmp_path: Path) -> None:
 
 def test_comment_arguments_do_not_shift_sink_indices(tmp_path: Path) -> None:
     (tmp_path / "sinks.c").write_text(
-        "void with_comment(void){ char buf[32]; snprintf(buf, /* size */ n, \"%s\", raw); }\n"
-        "void without_comment(void){ char buf[32]; snprintf(buf, n, \"%s\", raw); }\n"
+        "void with_comment(void){ char buf[32]; snprintf(buf, /* size */ n, fmt, raw); }\n"
+        "void without_comment(void){ char buf[32]; snprintf(buf, n, fmt, raw); }\n"
+        "void syslog_fmt(void){ syslog(pri, fmt, raw); }\n"
         "void alloc_comment(void){ char *p = malloc(/* size */ 128); }\n",
         encoding="utf-8",
     )
@@ -435,6 +436,27 @@ def test_comment_arguments_do_not_shift_sink_indices(tmp_path: Path) -> None:
     g.build()
     with_sink = g.functions["with_comment"][0].sinks[0]
     without_sink = g.functions["without_comment"][0].sinks[0]
-    assert with_sink.arg == "n"
-    assert without_sink.arg == "n"
+    assert with_sink.arg == "fmt"
+    assert without_sink.arg == "fmt"
+    assert g.functions["syslog_fmt"][0].sinks[0].arg == "fmt"
     assert g.functions["alloc_comment"][0].allocs[0].size_expr == "128"
+
+
+def test_literal_format_string_is_not_a_format_sink(tmp_path: Path) -> None:
+    (tmp_path / "lit.c").write_text(
+        'void safe(void){ char buf[32]; snprintf(buf, 32, "%s", raw); }\n',
+        encoding="utf-8",
+    )
+    g = CodeGraph(tmp_path)
+    g.build()
+    assert g.functions["safe"][0].sinks == []
+
+
+def test_ordinary_params_are_not_implicitly_tainted(tmp_path: Path) -> None:
+    (tmp_path / "params.c").write_text(
+        "void helper(char *name, int len){ printf(name); }\n",
+        encoding="utf-8",
+    )
+    g = CodeGraph(tmp_path)
+    g.build()
+    assert g.tainted("helper", "name") is False

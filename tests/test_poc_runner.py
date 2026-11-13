@@ -6,7 +6,7 @@ from typing import Any
 
 from harness import models as m
 from harness.containers import ExecResult
-from harness.council.poc import PocResult, run_and_correct_poc
+from harness.council.poc import poc_crash_evidence, PocResult, run_and_correct_poc
 from harness.council.task import _run_poc_safe
 from harness.db import Database
 from harness.llm import LLMResponse
@@ -103,9 +103,9 @@ async def test_poc_runner_corrects_and_succeeds(db: Database, tmp_path: Path) ->
     await db.set_finding_status(finding.id, FindingStatus.SURVIVED)
     checkout = _checkout(tmp_path)
     workspace = tmp_path / "workspaces" / "exploit"
-    llm = _ScriptedLLM(["print('# /work/checkout x')", "print('# /work/checkout\nPOC_SUCCESS')"])
+    llm = _ScriptedLLM(["print('# /work/checkout x')", "print('# /work/checkout\ncrash')"])
     sandbox = _FakeSandbox(
-        [ExecResult(1, "", "boom"), ExecResult(0, "POC_SUCCESS", "")],
+        [ExecResult(1, "", "boom"), ExecResult(-11, "", "ERROR: AddressSanitizer: heap-buffer-overflow")],
         tmp_path / "workspaces",
     )
 
@@ -123,7 +123,7 @@ async def test_poc_runner_corrects_and_succeeds(db: Database, tmp_path: Path) ->
     assert isinstance(result, PocResult)
     assert result.success is True
     assert len(result.attempts) == 2
-    assert [attempt.exit_code for attempt in result.attempts] == [1, 0]
+    assert [attempt.exit_code for attempt in result.attempts] == [1, -11]
     assert llm.calls == 2
 
     await db.set_finding_status(finding.id, FindingStatus.EXPLOITED)
@@ -133,7 +133,7 @@ async def test_poc_runner_corrects_and_succeeds(db: Database, tmp_path: Path) ->
 
     runs = await db.list_poc_runs(finding.id)
     assert len(runs) == 2
-    assert [row["exit_code"] for row in runs] == [1, 0]
+    assert [row["exit_code"] for row in runs] == [1, -11]
     assert [row["success"] for row in runs] == [0, 1]
 
     assert (workspace / "checkout" / "sample.c").exists()
@@ -189,3 +189,12 @@ async def test_run_poc_safe_absorbs_exec_exception(
     )
 
     assert result is None
+
+
+def test_poc_crash_evidence_detects_signal_and_asan() -> None:
+    assert poc_crash_evidence(-11, "", "") == "process killed by signal 11"
+    assert poc_crash_evidence(139, "", "") == "process exited with fatal status 139"
+    assert poc_crash_evidence(1, "", "compile error") is None
+    assert poc_crash_evidence(0, "POC_SUCCESS", "") is None
+    reason = poc_crash_evidence(1, "", "ERROR: AddressSanitizer: heap-buffer-overflow")
+    assert reason is not None and "AddressSanitizer" in reason

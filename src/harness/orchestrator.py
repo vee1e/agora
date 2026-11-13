@@ -43,6 +43,8 @@ MAX_TRACKED_MAIL = 1000
 MAX_CONTEXT_CHARS = 200_000
 MAX_CONTEXT_MESSAGE_CHARS = 8_000
 STALE_TURN_MAX_AGE_SECONDS = 3600.0
+CONTAINER_BACKOFF_SECONDS = 30.0
+DIGEST_BACKOFF_SECONDS = 60.0
 TRUNCATION_MARKER = " ...[truncated]"
 UNTRUSTED_CODE_OPEN = "<untrusted_code>"
 UNTRUSTED_CODE_CLOSE = "</untrusted_code>"
@@ -170,6 +172,8 @@ class Orchestrator:
         self._role_cursor = 0
         self._digest_cursor = 0
         self._slot_lock = asyncio.Lock()
+        self._container_backoff_until = 0.0
+        self._digest_backoff: dict[str, float] = {}
 
     @property
     def stopping(self) -> bool:
@@ -217,7 +221,7 @@ class Orchestrator:
                 }
             else:
                 try:
-                    result = self.tools.dispatch(name, arguments)
+                    result = await asyncio.to_thread(self.tools.dispatch, name, arguments)
                 except Exception as exc:  # noqa: BLE001
                     result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
                 if not isinstance(result, dict):
@@ -274,6 +278,7 @@ class Orchestrator:
             container = await self.containers.create(agent_id)
         except Exception as exc:
             await self.db.set_agent_state(agent_id, m.AgentState.DEAD)
+            self._container_backoff_until = time.monotonic() + CONTAINER_BACKOFF_SECONDS
             self._log(
                 "spawn",
                 action="container_failed",
@@ -306,7 +311,9 @@ class Orchestrator:
                 error=f"{type(exc).__name__}: {exc}",
             )
 
-    async def spawn_agent(self, role: m.AgentRole) -> m.Agent:
+    async def spawn_agent(
+        self, role: m.AgentRole, *, run_immediately: bool = True
+    ) -> m.Agent:
         async with self._slot_lock:
             await self.budget.check_global()
             live = await self._live_count()
@@ -322,12 +329,20 @@ class Orchestrator:
             await self.db.set_agent_topic(agent.id, topic.id)
 
             running = await self._running_count()
-            if running < self.settings.floor:
+            if run_immediately and running < self.settings.floor:
                 reserved = await self.db.transition_state(
                     agent.id, m.AgentState.SPAWNED, m.AgentState.RUNNING
                 )
                 if reserved:
-                    await self._ensure_container(agent.id)
+                    try:
+                        await self._ensure_container(agent.id)
+                    except Exception as exc:
+                        self._container_backoff_until = (
+                            time.monotonic() + CONTAINER_BACKOFF_SECONDS
+                        )
+                        raise SpawnRefused(
+                            f"container create failed: {type(exc).__name__}: {exc}"
+                        ) from exc
                     await self.db.touch_agent_wake(agent.id)
                     await self._enqueue(agent.id)
                 else:
@@ -383,6 +398,11 @@ class Orchestrator:
                 await self._drop_container(agent_id)
                 self._log("wake", agent_id=agent_id, state=m.AgentState.WAITING.value)
 
+    async def _requeue_running(self) -> None:
+        """Put RUNNING agents back on the worker queue after a restart or stall."""
+        for agent in await self.db.list_agents(m.AgentState.RUNNING):
+            await self._enqueue(agent.id)
+
     async def tick(self) -> None:
         budget_ok = True
         try:
@@ -401,6 +421,7 @@ class Orchestrator:
             self._drain_queue()
             return
 
+        await self._requeue_running()
         await self._maybe_digest()
 
         for agent in await self.db.list_agents(m.AgentState.WAITING):
@@ -452,6 +473,8 @@ class Orchestrator:
                 break
             if not await self.budget.can_spawn():
                 break
+            if time.monotonic() < self._container_backoff_until:
+                break
             try:
                 agent = await self.spawn_agent(self._next_role())
             except (BudgetExceeded, SpawnRefused):
@@ -480,8 +503,10 @@ class Orchestrator:
             )
             if len(pending) < threshold:
                 continue
+            if time.monotonic() < self._digest_backoff.get(topic.id, 0.0):
+                continue
             try:
-                await summarize_topic(
+                digest = await summarize_topic(
                     self.db,
                     self.llm,
                     topic.id,
@@ -490,11 +515,22 @@ class Orchestrator:
                     agent_id="summarizer",
                 )
             except Exception as exc:
+                self._digest_backoff[topic.id] = (
+                    time.monotonic() + DIGEST_BACKOFF_SECONDS
+                )
                 self._log(
                     "digest_error",
                     topic_id=topic.id,
                     error=f"{type(exc).__name__}: {exc}",
                 )
+                self._digest_cursor = (index + 1) % count
+                return
+            if digest is None:
+                self._digest_backoff[topic.id] = (
+                    time.monotonic() + DIGEST_BACKOFF_SECONDS
+                )
+            else:
+                self._digest_backoff.pop(topic.id, None)
             self._digest_cursor = (index + 1) % count
             return
         self._digest_cursor = (self._digest_cursor + scan) % count
@@ -551,7 +587,7 @@ class Orchestrator:
                 seeded = False
                 known_mail_ids: set[int] = set()
                 for _ in range(MAX_LLM_CALLS):
-                    if self.tools is None or not seeded:
+                    if not seeded:
                         unread = await self.mailbox.drain(agent_id)
                         posts = (
                             await self.db.list_posts_recent(agent.topic_id)
@@ -584,15 +620,27 @@ class Orchestrator:
                     tokens_out += response.usage.tokens_out
 
                     if tokens_in + tokens_out >= self.settings.turn_token_budget:
+                        messages.append(
+                            {"role": "assistant", "content": response.text}
+                        )
                         final = m.TurnState.BUDGET_EXCEEDED
                         reason = "turn_token_budget"
                         break
+                    if response.tool_calls and self.tools is not None:
+                        tool_result_chars = await self._apply_tool_calls(
+                            agent_id, messages, response, tool_result_chars
+                        )
+                        continue
                     if response.tool_calls:
-                        if self.tools is not None:
-                            tool_result_chars = await self._apply_tool_calls(
-                                agent_id, messages, response, tool_result_chars
-                            )
-                            continue
+                        messages.append(
+                            {
+                                "role": "assistant",
+                                "content": response.text,
+                                "tool_calls": list(response.tool_calls),
+                            }
+                        )
+                    else:
+                        messages.append({"role": "assistant", "content": response.text})
                     new_mail_ids = await self._known_unread_ids(agent_id)
                     if new_mail_ids - known_mail_ids:
                         seeded = False
@@ -739,6 +787,7 @@ class Orchestrator:
             asyncio.create_task(self._worker()) for _ in range(count)
         ]
         self._reconcile = asyncio.create_task(self.run_forever(self.interval))
+        await self._requeue_running()
 
     async def stop(self) -> None:
         self._stopping = True

@@ -1006,8 +1006,8 @@ async def test_tool_calls_per_response_capped(
     assert len(llm.calls) == 2
     second = llm.calls[1]["messages"]
     assistant = [msg for msg in second if msg.get("role") == "assistant"]
-    assert len(assistant) == 1
     assert len(assistant[0]["tool_calls"]) == 16
+    assert any(msg.get("content") == "done" for msg in assistant)
     tool_messages = [msg for msg in second if msg.get("role") == "tool"]
     assert len(tool_messages) == 16
     assert len(tools.dispatched) == 16

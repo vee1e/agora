@@ -94,13 +94,13 @@ async def test_create_honours_explicit_image(settings: Settings, db: Database) -
     assert row is not None and row.image == "custom:1"
 
 
-async def test_exec_returns_empty_success(settings: Settings, db: Database) -> None:
+async def test_exec_fails_when_docker_disabled(settings: Settings, db: Database) -> None:
     manager = ContainerManager(settings, db)
     container = await manager.create("ag_exec")
     result = await manager.exec(container.id, ["ls", "-la"])
-    assert result == ExecResult(0, "", "")
+    assert result.exit_code == 1
+    assert result.stderr == "docker is disabled"
     assert not result.stdout
-    assert not result.stderr
 
 
 async def test_status_is_running(settings: Settings, db: Database) -> None:

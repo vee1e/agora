@@ -480,6 +480,22 @@ async def test_judge_applies_verdict(
     assert stored is not None and stored.status is FindingStatus.SURVIVED
 
 
+
+async def test_judge_does_not_overturn_killed(
+    settings: Settings, db: Database, tools: CouncilTools
+) -> None:
+    finding = await _finding(db)
+    await db.set_finding_status(finding.id, FindingStatus.KILLED)
+    finding = await db.get_finding(finding.id)
+    llm = ScriptedLLM([_response(text='{"verdict": "survives", "reason": "I disagree"}')])
+
+    status = await judge_review(llm, tools, db, finding, "judge")
+
+    assert status is FindingStatus.KILLED
+    stored = await db.get_finding(finding.id)
+    assert stored is not None and stored.status is FindingStatus.KILLED
+
+
 async def test_judge_unparseable_leaves_candidate(
     settings: Settings, db: Database, tools: CouncilTools
 ) -> None:

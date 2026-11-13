@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends gcc libc6-dev binutils \
+    && apt-get install -y --no-install-recommends gcc libc6-dev binutils coreutils procps \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work

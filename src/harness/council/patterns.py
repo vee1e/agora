@@ -584,9 +584,9 @@ class PatternScanner:
             return True
         if text in LIMIT_MACROS or re.fullmatch(r"MAX_\w+", text):
             return True
-        if re.search(r"\d", text):
+        if re.search(r"(?i)(len|size|cap|bound|limit|max|count|nitems)\b", text):
             return True
-        return bool(self._words(text))
+        return False
 
     def _clamp_or_mask_present(
         self, body: Node, data: bytes, names: set[str], lang: str
@@ -671,7 +671,7 @@ class PatternScanner:
             if node.type != "if_statement":
                 continue
             cond = node.child_by_field_name("condition")
-            if cond is None or not self._refers_to_any(self._text(data, cond), names):
+            if cond is None or not self._condition_guards(cond, data, names, lang):
                 continue
             cons = node.child_by_field_name("consequence")
             if cons is not None and self._contains_exit(cons, data, lang):

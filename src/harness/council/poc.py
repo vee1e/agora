@@ -3,11 +3,13 @@
 The model writes a PoC for a finding; the sandbox runs it; if it fails, the
 failure output is fed back and the model rewrites it. Nothing is executed on the
 host. The PoC only ever runs inside the agent's container, which has no network,
-a read-only root filesystem, dropped capabilities, and a single writable mount.
+a read-only root filesystem, dropped capabilities, and a writable /work mount and a read-only bind of the staged checkout.
 """
 from __future__ import annotations
 
+import os
 import shutil
+import stat
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -59,18 +61,45 @@ POC_SYSTEM_PROMPT = (
     "say in a leading comment which resource you exhaust and why that is a "
     "reachable condition.\n"
     "\n"
-    "A successful demonstration is either a detected memory error or a crash. "
-    "Build with AddressSanitizer when the bug is a memory error: " 
+    "A successful demonstration is a detected memory error or a crash. "
+    "Build with AddressSanitizer when the bug is a memory error: "
     "`gcc -fsanitize=address -g -O0 /work/checkout/<file> ...`. AddressSanitizer "
-    "is installed and works here. Run the target with your input, capture the "
-    "result, and treat any of these as success: a non-zero return code, a negative "
-    "return code (a signal such as SIGSEGV), or `AddressSanitizer` in the output.\n"
+    "is installed and works here. Run the target with your input and capture "
+    "stdout and stderr. The harness decides success: it looks for an AddressSanitizer "
+    "(or other sanitizer) report in the output, or a fatal signal exit (a negative "
+    "status, or 128 plus a signal). A plain non-zero exit, including a compile "
+    "failure, is not a successful demonstration.\n"
     "\n"
-    "When the script demonstrates the finding, print the line "
-    f"{SUCCESS_MARKER} as the last line of stdout and exit 0. If you cannot "
-    "demonstrate it, exit non-zero. Return only the script body, no prose, no "
-    "code fences."
+    "Return only the script body, no prose, no code fences."
 )
+
+
+
+_SANITIZER_MARKERS = (
+    "ERROR: AddressSanitizer",
+    "ERROR: LeakSanitizer",
+    "ERROR: MemorySanitizer",
+    "ERROR: ThreadSanitizer",
+    "ERROR: UndefinedBehaviorSanitizer",
+    "SUMMARY: AddressSanitizer",
+    "SUMMARY: LeakSanitizer",
+    "SUMMARY: MemorySanitizer",
+    "SUMMARY: ThreadSanitizer",
+    "SUMMARY: UndefinedBehaviorSanitizer",
+)
+
+
+def poc_crash_evidence(exit_code: int, stdout: str, stderr: str) -> str | None:
+    """Return a reason if the process crashed or a sanitizer fired."""
+    blob = f"{stdout or ''}\n{stderr or ''}"
+    for marker in _SANITIZER_MARKERS:
+        if marker in blob:
+            return f"sanitizer reported {marker}"
+    if exit_code < 0:
+        return f"process killed by signal {-exit_code}"
+    if exit_code >= 128:
+        return f"process exited with fatal status {exit_code}"
+    return None
 
 
 @dataclass
@@ -115,6 +144,14 @@ def _clip(text: str, limit: int = 4000) -> str:
     return text[:limit] + "\n...[truncated]"
 
 
+def _clear_write_bits(path: Path) -> None:
+    try:
+        mode = path.stat().st_mode
+        path.chmod(mode & ~stat.S_IWUSR & ~stat.S_IWGRP & ~stat.S_IWOTH)
+    except OSError:
+        return
+
+
 def stage_checkout(checkout: str | Path, workspace: Path) -> Path:
     """Copy the checkout into the workspace so the container can see it at /work/checkout."""
     source = Path(checkout).resolve()
@@ -123,26 +160,39 @@ def stage_checkout(checkout: str | Path, workspace: Path) -> Path:
         shutil.rmtree(target, ignore_errors=True)
     target.mkdir(parents=True, exist_ok=True)
     copied = 0
-    for path in sorted(source.rglob("*")):
+    for dirpath, dirnames, filenames in os.walk(source, followlinks=False):
+        current = Path(dirpath)
+        # Do not walk through symlinked directories.
+        dirnames[:] = [
+            name
+            for name in sorted(dirnames)
+            if name not in STAGE_SKIP_DIRS and not (current / name).is_symlink()
+        ]
+        rel_dir = current.relative_to(source)
+        if any(part in STAGE_SKIP_DIRS for part in rel_dir.parts):
+            dirnames[:] = []
+            continue
+        dest_dir = target if rel_dir == Path('.') else target / rel_dir
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        for name in filenames:
+            if copied >= STAGE_MAX_FILES:
+                break
+            src = current / name
+            if src.is_symlink() or not src.is_file():
+                continue
+            try:
+                if src.stat().st_size > 2_000_000:
+                    continue
+                dest = dest_dir / name
+                shutil.copyfile(src, dest, follow_symlinks=False)
+                _clear_write_bits(dest)
+                copied += 1
+            except OSError:
+                continue
         if copied >= STAGE_MAX_FILES:
             break
-        if path.is_symlink():
-            continue
-        rel = path.relative_to(source)
-        if any(part in STAGE_SKIP_DIRS for part in rel.parts):
-            continue
-        if path.is_dir():
-            (target / rel).mkdir(parents=True, exist_ok=True)
-            continue
-        try:
-            if path.stat().st_size > 2_000_000:
-                continue
-            (target / rel).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(path, target / rel)
-            copied += 1
-        except OSError:
-            continue
-    target.chmod(0o777)
+    for dirpath, dirnames, filenames in os.walk(target, topdown=False, followlinks=False):
+        _clear_write_bits(Path(dirpath))
     return target
 
 
@@ -195,7 +245,7 @@ async def run_and_correct_poc(
     if not _valid_id(finding.id):
         return PocResult(finding_id=finding.id, success=False, reason="invalid finding id")
     workspace.mkdir(parents=True, exist_ok=True)
-    workspace.chmod(0o777)
+    workspace.chmod(0o755)
     stage_checkout(checkout, workspace)
     script_rel = f"poc_{finding.id}.py"
     script_path = workspace / script_rel
@@ -242,7 +292,7 @@ async def run_and_correct_poc(
         script_path.write_bytes(encoded)
         script_path.chmod(0o644)
 
-        if STAGED_DIR_NAME not in script:
+        if f"/work/{STAGED_DIR_NAME}" not in script:
             record = PocAttempt(
                 attempt=attempt,
                 script=script,
@@ -303,7 +353,8 @@ async def run_and_correct_poc(
             prior = record
             continue
         duration_ms = int((time.monotonic() - started) * 1000)
-        success = run.exit_code == 0 and SUCCESS_MARKER in run.stdout
+        evidence = poc_crash_evidence(run.exit_code, run.stdout, run.stderr)
+        success = evidence is not None
         record = PocAttempt(
             attempt=attempt,
             script=script,
@@ -339,6 +390,7 @@ async def run_and_correct_poc(
             )
         if success:
             result.success = True
+            result.reason = evidence
             result.script_path = str(script_path)
             return result
         prior = record

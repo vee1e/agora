@@ -84,6 +84,7 @@ TAINT_SOURCE_DEST_ARGS: dict[str, int] = {
     "scanf": 0,
 }
 COPY_SINK_DEST_ARG0 = {"strcpy", "strcat", "memcpy", "sprintf", "snprintf"}
+UNTRUSTED_PARAM_NAMES = {"argv", "argc", "args", "envp", "env"}
 PY_EXEC_SINKS = {"eval", "exec", "os.system", "os.popen", "subprocess.call", "subprocess.run", "subprocess.Popen"}
 
 SKIP_DIRS = {
@@ -493,6 +494,7 @@ class CodeGraph:
             sources=[
                 TaintSource(name=p, line=node.start_point[0] + 1, kind="param")
                 for p in params
+                if p and p.lower() in UNTRUSTED_PARAM_NAMES
             ],
         )
         if body is not None:
@@ -635,17 +637,17 @@ class CodeGraph:
             arg = self._text(data, arg_nodes[0]) if arg_nodes else ""
             func.sinks.append(Sink(name=base, line=line, arg=arg))
         elif base in FORMAT_SINKS:
-            if base == "fprintf" and len(arg_nodes) >= 2:
-                fmt = arg_nodes[1]
-                first = arg_nodes[1]
-            elif base in ("sprintf", "snprintf"):
-                fmt = arg_nodes[1] if len(arg_nodes) >= 2 else (arg_nodes[0] if arg_nodes else None)
-                first = fmt
-            else:
-                fmt = arg_nodes[0] if arg_nodes else None
-                first = fmt
+            fmt_index = {
+                "printf": 0,
+                "fprintf": 1,
+                "dprintf": 1,
+                "syslog": 1,
+                "sprintf": 1,
+                "snprintf": 2,
+            }.get(base, 0)
+            fmt = arg_nodes[fmt_index] if len(arg_nodes) > fmt_index else None
             if fmt is not None and fmt.type != "string_literal":
-                arg = self._text(data, first)
+                arg = self._text(data, fmt)
                 func.sinks.append(Sink(name=base, line=line, arg=arg))
 
     def _handle_c_declaration(self, data: bytes, node: Node, func: Function) -> None:
@@ -694,6 +696,7 @@ class CodeGraph:
             sources=[
                 TaintSource(name=p, line=node.start_point[0] + 1, kind="param")
                 for p in params
+                if p and p.lower() in UNTRUSTED_PARAM_NAMES
             ],
         )
         if body is not None:
@@ -851,11 +854,11 @@ class CodeGraph:
         return self._rhs_references(expr, tainted_vars)
 
     def _argv_names(self, func: Function) -> set[str]:
-        names: set[str] = set()
-        for param in func.params:
-            if param:
-                names.add(param)
-        return names
+        return {
+            param
+            for param in func.params
+            if param and param.lower() in UNTRUSTED_PARAM_NAMES
+        }
 
     def _text_has_source(self, text: str, source_names: set[str], argv_names: set[str]) -> bool:
         if not text:

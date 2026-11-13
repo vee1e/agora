@@ -6,6 +6,7 @@ writes a proof-of-concept body into a sandboxed workspace and never runs it.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -174,8 +175,9 @@ JUDGE_PROMPT = (
     "killer's argument and decide whether the call path still reaches the sink "
     "from untrusted input. Use read-only tools only. Report only. Never produce "
     "payloads or crash inputs. Never run code outside the sandbox, and you run no "
-    "code at all. Only override a 'survives' verdict when you can name specific "
-    "new evidence the killer did not give.\n"
+    "code at all. Never override a 'killed' verdict from the killer. Only "
+    "override a 'survives' verdict when you can name specific new evidence the "
+    "killer did not give.\n"
     'Return only JSON: {"verdict": "survives" or "killed", "reason": "..."}'
     + UNTRUSTED_NOTE
 )
@@ -266,7 +268,7 @@ async def run_tool_agent(
                 }
             else:
                 started = time.perf_counter()
-                result = tools.dispatch(name, arguments)
+                result = await asyncio.to_thread(tools.dispatch, name, arguments)
                 latency_ms = int((time.perf_counter() - started) * 1000)
                 _log_tool_call(
                     logger, agent_id, name or "", arguments, result, latency_ms
@@ -426,7 +428,11 @@ async def judge_review(
         temperature=0.0,
         logger=logger,
     )
-    return await _apply_verdict(db, finding, str(outcome.get("text", "")))
+    stored = await db.get_finding(finding.id)
+    prior = stored.status if stored is not None else finding.status
+    return await _apply_verdict(
+        db, finding, str(outcome.get("text", "")), prior=prior
+    )
 
 
 async def write_exploit(
@@ -477,8 +483,13 @@ async def write_exploit(
 
 
 async def _apply_verdict(
-    db: Database, finding: m.Finding, text: str
+    db: Database,
+    finding: m.Finding,
+    text: str,
+    prior: m.FindingStatus | None = None,
 ) -> m.FindingStatus:
+    if prior is m.FindingStatus.KILLED:
+        return m.FindingStatus.KILLED
     verdict = _parse_verdict(text)
     if verdict == "killed":
         await db.set_finding_status(finding.id, m.FindingStatus.KILLED)

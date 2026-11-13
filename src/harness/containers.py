@@ -82,6 +82,8 @@ class ContainerManager:
         return self._client
 
     def _run_container_sync(self, image: str, workspace: Path) -> Any:
+        checkout = workspace / "checkout"
+        checkout.mkdir(parents=True, exist_ok=True)
         client = self._client_sync()
         return client.containers.run(
             image,
@@ -97,7 +99,10 @@ class ContainerManager:
             network_mode=self.settings.sandbox_network,
             cap_drop=["ALL"],
             security_opt=["no-new-privileges"],
-            volumes={str(workspace): {"bind": "/work", "mode": "rw"}},
+            volumes={
+                str(workspace): {"bind": "/work", "mode": "rw"},
+                str(workspace / "checkout"): {"bind": "/work/checkout", "mode": "ro"},
+            },
             working_dir="/work",
         )
 
@@ -194,24 +199,62 @@ class ContainerManager:
         self, container_id: str, argv: list[str], timeout: int = 60
     ) -> ExecResult:
         if not self.settings.docker_enabled:
-            return ExecResult(0, "", "")
+            return ExecResult(1, "", "docker is disabled")
+
+        def _decode(raw: bytes | None) -> str:
+            return (raw or b"").decode("utf-8", errors="replace")
 
         def _exec() -> ExecResult:
             container = self._client_sync().containers.get(container_id)
-            result = container.exec_run(argv, demux=True, workdir="/work")
+            wrapped = [
+                "timeout",
+                "-s",
+                "KILL",
+                str(max(1, int(timeout))),
+                "--",
+                *argv,
+            ]
+            result = container.exec_run(wrapped, demux=True, workdir="/work")
             output = result.output if result.output is not None else (None, None)
             raw_out, raw_err = output
+            exit_code = result.exit_code if result.exit_code is not None else -1
+            if exit_code == 124:
+                return ExecResult(
+                    -1,
+                    _decode(raw_out),
+                    _decode(raw_err) or f"exec timed out after {timeout}s",
+                )
             return ExecResult(
-                exit_code=result.exit_code if result.exit_code is not None else -1,
-                stdout=(raw_out or b"").decode("utf-8", errors="replace"),
-                stderr=(raw_err or b"").decode("utf-8", errors="replace"),
+                exit_code=exit_code,
+                stdout=_decode(raw_out),
+                stderr=_decode(raw_err),
             )
+
+        def _kill_leftover() -> None:
+            try:
+                container = self._client_sync().containers.get(container_id)
+                container.exec_run(
+                    [
+                        "sh",
+                        "-c",
+                        "for p in /proc/[0-9]*; do pid=${p#/proc/}; "
+                        '[ "$pid" = 1 ] && continue; '
+                        'kill -9 "$pid" 2>/dev/null || true; '
+                        "done",
+                    ],
+                    workdir="/work",
+                )
+            except Exception:
+                return
 
         semaphore = self._exec_semaphore(container_id)
         async with semaphore:
             try:
-                return await asyncio.wait_for(asyncio.to_thread(_exec), timeout=timeout)
+                return await asyncio.wait_for(
+                    asyncio.to_thread(_exec), timeout=float(timeout) + 5.0
+                )
             except asyncio.TimeoutError:
+                await asyncio.to_thread(_kill_leftover)
                 return ExecResult(-1, "", f"exec timed out after {timeout}s")
 
     async def status(self, container_id: str) -> m.ContainerStatus:

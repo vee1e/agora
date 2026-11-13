@@ -683,8 +683,9 @@ async def test_run_council_sandbox_failure_keeps_survived(
     assert result.pocs_run == 1
     assert result.pocs_succeeded == 0
     assert result.findings[0].status is FindingStatus.SURVIVED
-    assert sandbox.created == ["exploit"]
-    assert sandbox.removed == ["fake-exploit"]
+    assert len(sandbox.created) == 1
+    assert sandbox.created[0].startswith("exploit-")
+    assert sandbox.removed == [f"fake-{sandbox.created[0]}"]
 
 
 async def test_run_council_sandbox_success_sets_exploited(
@@ -713,11 +714,11 @@ async def test_run_council_sandbox_success_sets_exploited(
             _response("[]"),
             _response(_verdict("survives", "reachable")),
             _response(_verdict("survives", "path holds")),
-            _response("# /work/checkout\nprint('POC_SUCCESS')"),
+            _response("# /work/checkout\nprint('asan')"),
         ]
     )
     sandbox = _TaskSandbox(
-        [ExecResult(0, "POC_SUCCESS", "")], settings.workspace_dir
+        [ExecResult(-11, "", "ERROR: AddressSanitizer: heap-buffer-overflow")], settings.workspace_dir
     )
     checkout = _poc_checkout(tmp_path)
 
@@ -781,7 +782,7 @@ async def test_run_council_creates_one_container_and_removes_it(
             _response("# /work/checkout\nprint('a')"),
             _response("# /work/checkout\nprint('b')"),
             _response("# /work/checkout\nprint('c')"),
-            _response("# /work/checkout\nprint('POC_SUCCESS')"),
+            _response("# /work/checkout\nprint('asan')"),
         ]
     )
     sandbox = _TaskSandbox(
@@ -789,7 +790,7 @@ async def test_run_council_creates_one_container_and_removes_it(
             ExecResult(1, "", "no"),
             ExecResult(1, "", "no"),
             ExecResult(1, "", "no"),
-            ExecResult(0, "POC_SUCCESS", ""),
+            ExecResult(-11, "", "ERROR: AddressSanitizer: heap-buffer-overflow"),
         ],
         settings.workspace_dir,
     )
@@ -812,8 +813,9 @@ async def test_run_council_creates_one_container_and_removes_it(
     assert result.exploited == 1
     assert result.pocs_run == 2
     assert result.pocs_succeeded == 1
-    assert sandbox.created == ["exploit"]
-    assert sandbox.removed == ["fake-exploit"]
+    assert len(sandbox.created) == 2
+    assert all(name.startswith("exploit-") for name in sandbox.created)
+    assert sandbox.removed == [f"fake-{name}" for name in sandbox.created]
     statuses = {finding.sink: finding.status for finding in result.findings}
     assert statuses["strcpy"] is FindingStatus.SURVIVED
     assert statuses["strcat"] is FindingStatus.EXPLOITED
