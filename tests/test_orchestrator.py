@@ -909,7 +909,7 @@ async def test_finish_reason_length_breaks_after_one_call_with_unread_mail(
     assert turns[0].state is m.TurnState.DONE
 
 
-async def test_new_mail_reseeds_context_instead_of_resending(
+async def test_new_mail_is_appended_without_dropping_transcript(
     settings: Settings, db: Database, logger: EventLogger
 ) -> None:
     tools = StubTools()
@@ -921,10 +921,17 @@ async def test_new_mail_reseeds_context_instead_of_resending(
 
     assert len(llm.calls) == 2
     first_user = llm.calls[0]["messages"][1]["content"]
-    second_user = llm.calls[1]["messages"][1]["content"]
+    second_msgs = llm.calls[1]["messages"]
     assert "fresh mail body" not in first_user
-    assert "fresh mail body" in second_user
-    assert first_user != second_user
+    assert second_msgs[1]["content"] == first_user
+    assert any(
+        msg.get("role") == "user" and "fresh mail body" in str(msg.get("content"))
+        for msg in second_msgs
+    )
+    assert any(
+        msg.get("role") == "assistant" and msg.get("content") == "final"
+        for msg in second_msgs
+    )
     turns = await db.list_turns(agent.id)
     assert turns[0].state is m.TurnState.DONE
 

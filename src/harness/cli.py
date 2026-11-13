@@ -39,7 +39,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     serve = subparsers.add_parser("serve", help="run the orchestrator loop")
     serve.add_argument("--interval", type=float, default=1.0)
-    serve.add_argument("--checkout", default=".")
+    serve.add_argument("--checkout", default=None)
 
     subparsers.add_parser("status", help="print agent and budget status")
 

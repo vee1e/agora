@@ -418,6 +418,9 @@ async def judge_review(
     killer_reason: str | None = None,
     logger: EventLogger | None = None,
 ) -> m.FindingStatus:
+    stored = await db.get_finding(finding.id)
+    if (stored.status if stored is not None else finding.status) is m.FindingStatus.KILLED:
+        return m.FindingStatus.KILLED
     task_prompt = _review_task("judge", finding, killer_reason=killer_reason)
     outcome = await run_tool_agent(
         llm,

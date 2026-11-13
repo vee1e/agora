@@ -594,6 +594,9 @@ class _TaskSandbox:
         self.created: list[str] = []
         self.removed: list[str] = []
 
+    def workspace_for(self, agent_id: str) -> Path:
+        return Path(self.settings.workspace_dir) / agent_id
+
     async def create(self, agent_id: str) -> m.Container:
         if self._create_error is not None:
             raise self._create_error
@@ -718,7 +721,7 @@ async def test_run_council_sandbox_success_sets_exploited(
         ]
     )
     sandbox = _TaskSandbox(
-        [ExecResult(-11, "", "ERROR: AddressSanitizer: heap-buffer-overflow")], settings.workspace_dir
+        [ExecResult(-11, "", "ERROR: AddressSanitizer: heap-buffer-overflow\n    #0 0x1 in vuln /work/checkout/sample.c:6")], settings.workspace_dir
     )
     checkout = _poc_checkout(tmp_path)
 
@@ -741,7 +744,7 @@ async def test_run_council_sandbox_success_sets_exploited(
     assert result.pocs_run == 1
     assert result.pocs_succeeded == 1
     assert result.findings[0].status is FindingStatus.EXPLOITED
-    assert (settings.workspace_dir / "exploit" / "checkout" / "sample.c").exists()
+    assert (settings.workspace_dir / sandbox.created[0] / "checkout" / "sample.c").exists()
     assert sandbox.exec_calls
 
 
@@ -790,7 +793,7 @@ async def test_run_council_creates_one_container_and_removes_it(
             ExecResult(1, "", "no"),
             ExecResult(1, "", "no"),
             ExecResult(1, "", "no"),
-            ExecResult(-11, "", "ERROR: AddressSanitizer: heap-buffer-overflow"),
+            ExecResult(-11, "", "ERROR: AddressSanitizer: heap-buffer-overflow\n    #0 0x1 in vuln /work/checkout/sample.c:6"),
         ],
         settings.workspace_dir,
     )

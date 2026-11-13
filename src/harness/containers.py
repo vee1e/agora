@@ -41,6 +41,7 @@ class ExecResult:
     exit_code: int
     stdout: str
     stderr: str
+    timed_out: bool = False
 
 
 class ContainerManager:
@@ -209,7 +210,9 @@ class ContainerManager:
             wrapped = [
                 "timeout",
                 "-s",
-                "KILL",
+                "TERM",
+                "-k",
+                "1",
                 str(max(1, int(timeout))),
                 "--",
                 *argv,
@@ -218,11 +221,13 @@ class ContainerManager:
             output = result.output if result.output is not None else (None, None)
             raw_out, raw_err = output
             exit_code = result.exit_code if result.exit_code is not None else -1
-            if exit_code == 124:
+            # 124: timeout expired; 137: SIGKILL (timeout -k or cgroup OOM).
+            if exit_code in (124, 137):
                 return ExecResult(
-                    -1,
-                    _decode(raw_out),
-                    _decode(raw_err) or f"exec timed out after {timeout}s",
+                    exit_code=-1,
+                    stdout=_decode(raw_out),
+                    stderr=_decode(raw_err) or f"exec timed out after {timeout}s",
+                    timed_out=True,
                 )
             return ExecResult(
                 exit_code=exit_code,
@@ -237,8 +242,11 @@ class ContainerManager:
                     [
                         "sh",
                         "-c",
+                        "self=$$; parent=$PPID; "
                         "for p in /proc/[0-9]*; do pid=${p#/proc/}; "
                         '[ "$pid" = 1 ] && continue; '
+                        '[ "$pid" = "$self" ] && continue; '
+                        '[ "$pid" = "$parent" ] && continue; '
                         'kill -9 "$pid" 2>/dev/null || true; '
                         "done",
                     ],
@@ -250,12 +258,17 @@ class ContainerManager:
         semaphore = self._exec_semaphore(container_id)
         async with semaphore:
             try:
-                return await asyncio.wait_for(
+                result = await asyncio.wait_for(
                     asyncio.to_thread(_exec), timeout=float(timeout) + 5.0
                 )
             except asyncio.TimeoutError:
                 await asyncio.to_thread(_kill_leftover)
-                return ExecResult(-1, "", f"exec timed out after {timeout}s")
+                return ExecResult(
+                    -1, "", f"exec timed out after {timeout}s", timed_out=True
+                )
+            if result.timed_out:
+                await asyncio.to_thread(_kill_leftover)
+            return result
 
     async def status(self, container_id: str) -> m.ContainerStatus:
         if not self.settings.docker_enabled:

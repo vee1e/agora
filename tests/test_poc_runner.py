@@ -40,6 +40,9 @@ class _FakeSandbox:
         self.created: list[str] = []
         self.removed: list[str] = []
 
+    def workspace_for(self, agent_id: str) -> Path:
+        return Path(self.settings.workspace_dir) / agent_id
+
     async def create(self, agent_id: str) -> m.Container:
         self.created.append(agent_id)
         return m.Container(
@@ -105,7 +108,7 @@ async def test_poc_runner_corrects_and_succeeds(db: Database, tmp_path: Path) ->
     workspace = tmp_path / "workspaces" / "exploit"
     llm = _ScriptedLLM(["print('# /work/checkout x')", "print('# /work/checkout\ncrash')"])
     sandbox = _FakeSandbox(
-        [ExecResult(1, "", "boom"), ExecResult(-11, "", "ERROR: AddressSanitizer: heap-buffer-overflow")],
+        [ExecResult(1, "", "boom"), ExecResult(-11, "", "ERROR: AddressSanitizer: heap-buffer-overflow\n    #0 0x1 in vuln /work/checkout/sample.c:6")],
         tmp_path / "workspaces",
     )
 
@@ -196,5 +199,15 @@ def test_poc_crash_evidence_detects_signal_and_asan() -> None:
     assert poc_crash_evidence(139, "", "") == "process exited with fatal status 139"
     assert poc_crash_evidence(1, "", "compile error") is None
     assert poc_crash_evidence(0, "POC_SUCCESS", "") is None
-    reason = poc_crash_evidence(1, "", "ERROR: AddressSanitizer: heap-buffer-overflow")
+    assert poc_crash_evidence(-1, "", "timed out", timed_out=True) is None
+    assert poc_crash_evidence(137, "", "") is None
+    assert poc_crash_evidence(-1, "", "") is None
+    assert poc_crash_evidence(-9, "", "") is None
+    # Sanitizer text without a checkout frame is not enough.
+    assert poc_crash_evidence(1, "", "ERROR: AddressSanitizer: heap-buffer-overflow") is None
+    reason = poc_crash_evidence(
+        1,
+        "",
+        "ERROR: AddressSanitizer: heap-buffer-overflow\n    #0 0x1 in vuln /work/checkout/sample.c:6",
+    )
     assert reason is not None and "AddressSanitizer" in reason

@@ -54,6 +54,17 @@ UNTRUSTED_CODE_OVERHEAD = len(UNTRUSTED_CODE_OPEN) + len(UNTRUSTED_CODE_CLOSE)
 class SpawnRefused(Exception):
     pass
 
+def _format_incoming_mail(unread: list) -> str:
+    lines = ["New unread mail arrived during this turn:"]
+    for message in unread:
+        body = clip_untrusted(getattr(message, "body", "") or "", 2000)
+        mid = getattr(message, "id", None)
+        sender = getattr(message, "sender_id", None) or getattr(message, "from_id", None) or "unknown"
+        lines.append(f"- #{mid} from {sender}: {body}")
+    return "\n".join(lines)
+
+
+
 
 def _truncate_text(text: str, limit: int) -> str:
     if len(text) <= limit:
@@ -277,8 +288,16 @@ class Orchestrator:
         try:
             container = await self.containers.create(agent_id)
         except Exception as exc:
-            await self.db.set_agent_state(agent_id, m.AgentState.DEAD)
             self._container_backoff_until = time.monotonic() + CONTAINER_BACKOFF_SECONDS
+            try:
+                await self.state_machine.transition(
+                    agent_id, m.AgentState.WAITING, reason="container_failed"
+                )
+            except InvalidTransition:
+                try:
+                    await self.db.set_agent_state(agent_id, m.AgentState.WAITING)
+                except Exception:
+                    pass
             self._log(
                 "spawn",
                 action="container_failed",
@@ -427,6 +446,8 @@ class Orchestrator:
         for agent in await self.db.list_agents(m.AgentState.WAITING):
             if len(running) >= self.settings.hard_cap:
                 break
+            if time.monotonic() < self._container_backoff_until:
+                break
             async with self._slot_lock:
                 if await self._running_count() >= self.settings.hard_cap:
                     break
@@ -447,6 +468,8 @@ class Orchestrator:
 
         for agent in await self.db.list_agents(m.AgentState.PAUSED):
             if len(running) >= self.settings.hard_cap:
+                break
+            if time.monotonic() < self._container_backoff_until:
                 break
             if not await self.mailbox.has_unread(agent.id):
                 continue
@@ -642,8 +665,22 @@ class Orchestrator:
                     else:
                         messages.append({"role": "assistant", "content": response.text})
                     new_mail_ids = await self._known_unread_ids(agent_id)
-                    if new_mail_ids - known_mail_ids:
-                        seeded = False
+                    incoming = new_mail_ids - known_mail_ids
+                    if incoming:
+                        unread = await self.mailbox.drain(agent_id)
+                        if unread:
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": _format_incoming_mail(unread),
+                                }
+                            )
+                        known_mail_ids |= incoming
+                        known_mail_ids |= {
+                            message.id
+                            for message in unread
+                            if message.id is not None
+                        }
                         continue
                     break
             except Exception as exc:
@@ -767,10 +804,14 @@ class Orchestrator:
                 self._queue.task_done()
 
     async def start(
-        self, stale_max_age_seconds: float = STALE_TURN_MAX_AGE_SECONDS
+        self, stale_max_age_seconds: float = -1.0
     ) -> None:
         self._stopping = False
-        stale_agents = await self.db.close_stale_turns(stale_max_age_seconds)
+        # A negative threshold means "close every open turn": the process
+        # that owned them is gone. close_stale_turns uses cutoff = now - age,
+        # so a negative age puts the cutoff in the future.
+        age = stale_max_age_seconds if stale_max_age_seconds >= 0 else -1.0
+        stale_agents = await self.db.close_stale_turns(age)
         for agent_id in stale_agents:
             agent = await self.db.get_agent(agent_id)
             if agent is None or agent.state is m.AgentState.DEAD:

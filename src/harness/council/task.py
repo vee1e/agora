@@ -26,7 +26,7 @@ from .agents import (
     killer_refute,
     write_exploit,
 )
-from .poc import PocResult, run_and_correct_poc
+from .poc import PocResult, run_and_correct_poc, stage_checkout
 from .tools import CouncilTools
 
 MAX_REVIEWED_DEFAULT = 25
@@ -112,7 +112,6 @@ async def run_council(
                 finding_id=finding.id,
                 error=f"{type(exc).__name__}: {exc}",
             )
-            continue
         stored = await db.get_finding(finding.id)
         status = stored.status if stored is not None else finding.status
         if status is m.FindingStatus.SURVIVED:
@@ -264,6 +263,12 @@ async def _run_sandbox_pocs(
         agent_key = f"{exploit_id}-{slug}"
         try:
             try:
+                if hasattr(containers, "workspace_for"):
+                    finding_workspace = Path(containers.workspace_for(agent_key))
+                else:
+                    finding_workspace = workspace / agent_key
+                finding_workspace.mkdir(parents=True, exist_ok=True)
+                stage_checkout(checkout, finding_workspace)
                 container = await containers.create(agent_key)
                 container_id = container.id
                 created_any = True
@@ -296,7 +301,7 @@ async def _run_sandbox_pocs(
                 container_id,
                 finding,
                 checkout,
-                workspace,
+                finding_workspace,
                 exploit_id,
                 logger,
             )
