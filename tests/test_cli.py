@@ -133,7 +133,8 @@ def test_cli_lifecycle(
 
     db_path = tmp_path / "cli.db"
     counts = asyncio.run(_counts(db_path))
-    assert counts == {"agents": 1, "running": 1}
+    assert counts == {"agents": 1, "running": 0}
+    assert "state=waiting" in spawn_out
 
     topics, posts = asyncio.run(_posts(db_path))
     assert len([topic for topic in topics if topic.title == "general"]) == 1

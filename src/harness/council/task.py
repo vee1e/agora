@@ -26,7 +26,7 @@ from .agents import (
     killer_refute,
     write_exploit,
 )
-from .poc import PocResult, run_and_correct_poc
+from .poc import PocResult, run_and_correct_poc, stage_checkout
 from .tools import CouncilTools
 
 MAX_REVIEWED_DEFAULT = 25
@@ -92,18 +92,26 @@ async def run_council(
     survivors: list[m.Finding] = []
     killed = 0
     for finding in reviewed:
-        verdict = await killer_refute(
-            llm, tools, db, finding, killer_id, logger=logger
-        )
-        await judge_review(
-            llm,
-            tools,
-            db,
-            finding,
-            judge_id,
-            killer_reason=verdict.reason,
-            logger=logger,
-        )
+        try:
+            verdict = await killer_refute(
+                llm, tools, db, finding, killer_id, logger=logger
+            )
+            await judge_review(
+                llm,
+                tools,
+                db,
+                finding,
+                judge_id,
+                killer_reason=verdict.reason,
+                logger=logger,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log_logger(
+                logger,
+                "council_review_error",
+                finding_id=finding.id,
+                error=f"{type(exc).__name__}: {exc}",
+            )
         stored = await db.get_finding(finding.id)
         status = stored.status if stored is not None else finding.status
         if status is m.FindingStatus.SURVIVED:
@@ -245,27 +253,46 @@ async def _run_sandbox_pocs(
     logger: EventLogger | None,
     notes: list[str],
 ) -> tuple[int, int, int] | None:
-    container_id: str | None = None
-    try:
+    exploited = 0
+    pocs_run = 0
+    pocs_succeeded = 0
+    created_any = False
+    for finding in survivors:
+        container_id: str | None = None
+        slug = finding.id.replace("/", "-")[:32]
+        agent_key = f"{exploit_id}-{slug}"
         try:
-            container = await containers.create(exploit_id)
-            container_id = container.id
-        except Exception as exc:
-            _log_event(
-                message_board,
-                "council_sandbox_unavailable",
-                exploit_id=exploit_id,
-                error=f"{type(exc).__name__}: {exc}",
-            )
-            notes.append(
-                "warning: sandbox unavailable; proof-of-concept scripts were "
-                "written host-side"
-            )
-            return None
-        exploited = 0
-        pocs_run = 0
-        pocs_succeeded = 0
-        for finding in survivors:
+            try:
+                if hasattr(containers, "workspace_for"):
+                    finding_workspace = Path(containers.workspace_for(agent_key))
+                else:
+                    finding_workspace = workspace / agent_key
+                finding_workspace.mkdir(parents=True, exist_ok=True)
+                stage_checkout(checkout, finding_workspace)
+                container = await containers.create(agent_key)
+                container_id = container.id
+                created_any = True
+            except Exception as exc:
+                if not created_any and finding is survivors[0]:
+                    _log_event(
+                        message_board,
+                        "council_sandbox_unavailable",
+                        exploit_id=exploit_id,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                    notes.append(
+                        "warning: sandbox unavailable; proof-of-concept scripts were "
+                        "written host-side"
+                    )
+                    return None
+                _log_event(
+                    message_board,
+                    "council_sandbox_unavailable",
+                    exploit_id=exploit_id,
+                    finding_id=finding.id,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                continue
             pocs_run += 1
             poc_result = await _run_poc_safe(
                 llm,
@@ -274,7 +301,7 @@ async def _run_sandbox_pocs(
                 container_id,
                 finding,
                 checkout,
-                workspace,
+                finding_workspace,
                 exploit_id,
                 logger,
             )
@@ -291,18 +318,18 @@ async def _run_sandbox_pocs(
                 _log_event(
                     message_board, "council_poc_failed", finding_id=finding.id, reason=reason
                 )
-        return (exploited, pocs_run, pocs_succeeded)
-    finally:
-        if container_id is not None:
-            try:
-                await containers.remove(container_id)
-            except Exception as exc:
-                _log_event(
-                    message_board,
-                    "council_container_remove_failed",
-                    container_id=container_id,
-                    error=f"{type(exc).__name__}: {exc}",
-                )
+        finally:
+            if container_id is not None:
+                try:
+                    await containers.remove(container_id)
+                except Exception as exc:
+                    _log_event(
+                        message_board,
+                        "council_container_remove_failed",
+                        container_id=container_id,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+    return (exploited, pocs_run, pocs_succeeded)
 
 
 def _log_logger(logger: EventLogger | None, kind: str, **fields: Any) -> None:

@@ -136,7 +136,7 @@ async def _cmd_spawn(settings: Settings, role_name: str) -> int:
     orchestrator = await build_orchestrator(settings)
     try:
         role = m.AgentRole(role_name)
-        agent = await orchestrator.spawn_agent(role)
+        agent = await orchestrator.spawn_agent(role, run_immediately=False)
         print(
             f"spawned {agent.id} role={agent.role.value} state={agent.state.value}"
         )

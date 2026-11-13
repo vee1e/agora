@@ -449,7 +449,7 @@ async def test_error_body_over_cap_raises(settings: Settings) -> None:
     assert "max_response_bytes" in str(excinfo.value)
 
 
-async def test_missing_usage_logs_warning(settings: Settings, logger) -> None:
+async def test_missing_usage_is_an_error(settings: Settings, logger) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
@@ -467,16 +467,16 @@ async def test_missing_usage_logs_warning(settings: Settings, logger) -> None:
 
     client, http = _client_for(handler, settings, logger=logger)
     try:
-        resp = await client.complete([{"role": "user", "content": "hi"}])
+        with pytest.raises(LLMError, match="usage missing"):
+            await client.complete([{"role": "user", "content": "hi"}])
     finally:
         await http.aclose()
 
-    assert resp.usage.total == 0
     records = [
         json.loads(line)
         for line in (settings.log_dir / "llm.jsonl").read_text().splitlines()
     ]
-    assert "usage missing" in (records[-1]["note"] or "")
+    assert "usage missing" in (records[-1]["error"] or records[-1].get("note") or "")
 
 
 async def test_logs_model_returned_by_provider(settings: Settings, logger) -> None:

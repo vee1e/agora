@@ -3,11 +3,13 @@
 The model writes a PoC for a finding; the sandbox runs it; if it fails, the
 failure output is fed back and the model rewrites it. Nothing is executed on the
 host. The PoC only ever runs inside the agent's container, which has no network,
-a read-only root filesystem, dropped capabilities, and a single writable mount.
+a read-only root filesystem, dropped capabilities, and a writable /work mount and a read-only bind of the staged checkout.
 """
 from __future__ import annotations
 
+import os
 import shutil
+import stat
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -59,18 +61,77 @@ POC_SYSTEM_PROMPT = (
     "say in a leading comment which resource you exhaust and why that is a "
     "reachable condition.\n"
     "\n"
-    "A successful demonstration is either a detected memory error or a crash. "
-    "Build with AddressSanitizer when the bug is a memory error: " 
+    "A successful demonstration is a detected memory error or a crash. "
+    "Build with AddressSanitizer when the bug is a memory error: "
     "`gcc -fsanitize=address -g -O0 /work/checkout/<file> ...`. AddressSanitizer "
-    "is installed and works here. Run the target with your input, capture the "
-    "result, and treat any of these as success: a non-zero return code, a negative "
-    "return code (a signal such as SIGSEGV), or `AddressSanitizer` in the output.\n"
+    "is installed and works here. Run the target with your input and capture "
+    "stdout and stderr. Stream the child process's stdout and stderr, and exit "
+    "with the child's status. Do not print sanitizer strings or fake a fatal "
+    "exit yourself. The harness decides success: it looks for an AddressSanitizer "
+    "(or other sanitizer) report that mentions a path under /work/checkout, or a "
+    "fatal crash signal (SIGSEGV, SIGABRT, and similar). A timeout, OOM kill, "
+    "plain non-zero exit, or compile failure is not a successful demonstration.\n"
     "\n"
-    "When the script demonstrates the finding, print the line "
-    f"{SUCCESS_MARKER} as the last line of stdout and exit 0. If you cannot "
-    "demonstrate it, exit non-zero. Return only the script body, no prose, no "
-    "code fences."
+    "Return only the script body, no prose, no code fences."
 )
+
+
+
+_SANITIZER_MARKERS = (
+    "ERROR: AddressSanitizer",
+    "ERROR: LeakSanitizer",
+    "ERROR: MemorySanitizer",
+    "ERROR: ThreadSanitizer",
+    "ERROR: UndefinedBehaviorSanitizer",
+    "SUMMARY: AddressSanitizer",
+    "SUMMARY: LeakSanitizer",
+    "SUMMARY: MemorySanitizer",
+    "SUMMARY: ThreadSanitizer",
+    "SUMMARY: UndefinedBehaviorSanitizer",
+)
+
+
+# Crash signals only. SIGKILL (9), SIGHUP (1) and SIGTERM (15) are
+# infrastructure or timeout leftovers, not exploit evidence.
+_CRASH_SIGNALS = {4, 5, 6, 7, 8, 11}  # ILL, TRAP, ABRT, BUS, FPE, SEGV
+_CHECKOUT_PATH_MARKER = f"/work/{STAGED_DIR_NAME}"
+
+
+def poc_crash_evidence(
+    exit_code: int,
+    stdout: str,
+    stderr: str,
+    *,
+    timed_out: bool = False,
+) -> str | None:
+    """Return a reason if the process crashed or a sanitizer fired."""
+    if timed_out:
+        return None
+    blob = f"{stdout or ''}\n{stderr or ''}"
+    for marker in _SANITIZER_MARKERS:
+        if marker in blob and _CHECKOUT_PATH_MARKER in blob:
+            return f"sanitizer reported {marker}"
+    if exit_code in (-1, 124, 137):
+        return None
+    if exit_code < 0:
+        sig = -exit_code
+        if sig in _CRASH_SIGNALS:
+            return f"process killed by signal {sig}"
+        return None
+    if exit_code >= 128:
+        sig = exit_code - 128
+        if sig in _CRASH_SIGNALS:
+            return f"process exited with fatal status {exit_code}"
+        return None
+    return None
+
+
+def script_forges_evidence(script: str) -> str | None:
+    """Reject wrapper scripts that plant sanitizer markers or fake fatal exits."""
+    for marker in _SANITIZER_MARKERS:
+        if marker in script:
+            return f"script contains sanitizer marker {marker!r}"
+    return None
 
 
 @dataclass
@@ -115,34 +176,95 @@ def _clip(text: str, limit: int = 4000) -> str:
     return text[:limit] + "\n...[truncated]"
 
 
+def _clear_write_bits(path: Path) -> None:
+    try:
+        mode = path.stat().st_mode
+        path.chmod(mode & ~stat.S_IWUSR & ~stat.S_IWGRP & ~stat.S_IWOTH)
+    except OSError:
+        return
+
+
+def _restore_owner_write(path: Path) -> None:
+    try:
+        mode = path.stat().st_mode
+        path.chmod(mode | stat.S_IWUSR)
+    except OSError:
+        return
+
+
+def _empty_dir(target: Path) -> None:
+    """Remove children of ``target`` without replacing the directory inode."""
+    if not target.exists():
+        return
+    _restore_owner_write(target)
+    for child in target.iterdir():
+        try:
+            if child.is_symlink() or child.is_file():
+                _restore_owner_write(child)
+                child.unlink()
+            elif child.is_dir():
+                for dirpath, dirnames, filenames in os.walk(
+                    child, topdown=False, followlinks=False
+                ):
+                    current = Path(dirpath)
+                    _restore_owner_write(current)
+                    for name in filenames:
+                        path = current / name
+                        _restore_owner_write(path)
+                        path.unlink(missing_ok=True)
+                    for name in dirnames:
+                        sub = current / name
+                        _restore_owner_write(sub)
+                        try:
+                            sub.rmdir()
+                        except OSError:
+                            shutil.rmtree(sub, ignore_errors=True)
+                try:
+                    child.rmdir()
+                except OSError:
+                    shutil.rmtree(child, ignore_errors=True)
+        except OSError:
+            continue
+
+
 def stage_checkout(checkout: str | Path, workspace: Path) -> Path:
     """Copy the checkout into the workspace so the container can see it at /work/checkout."""
     source = Path(checkout).resolve()
     target = workspace / STAGED_DIR_NAME
-    if target.exists():
-        shutil.rmtree(target, ignore_errors=True)
     target.mkdir(parents=True, exist_ok=True)
+    _empty_dir(target)
     copied = 0
-    for path in sorted(source.rglob("*")):
+    for dirpath, dirnames, filenames in os.walk(source, followlinks=False):
+        current = Path(dirpath)
+        # Do not walk through symlinked directories.
+        dirnames[:] = [
+            name
+            for name in sorted(dirnames)
+            if name not in STAGE_SKIP_DIRS and not (current / name).is_symlink()
+        ]
+        rel_dir = current.relative_to(source)
+        if any(part in STAGE_SKIP_DIRS for part in rel_dir.parts):
+            dirnames[:] = []
+            continue
+        dest_dir = target if rel_dir == Path('.') else target / rel_dir
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        for name in filenames:
+            if copied >= STAGE_MAX_FILES:
+                break
+            src = current / name
+            if src.is_symlink() or not src.is_file():
+                continue
+            try:
+                if src.stat().st_size > 2_000_000:
+                    continue
+                dest = dest_dir / name
+                shutil.copyfile(src, dest, follow_symlinks=False)
+                _clear_write_bits(dest)
+                copied += 1
+            except OSError:
+                continue
         if copied >= STAGE_MAX_FILES:
             break
-        if path.is_symlink():
-            continue
-        rel = path.relative_to(source)
-        if any(part in STAGE_SKIP_DIRS for part in rel.parts):
-            continue
-        if path.is_dir():
-            (target / rel).mkdir(parents=True, exist_ok=True)
-            continue
-        try:
-            if path.stat().st_size > 2_000_000:
-                continue
-            (target / rel).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(path, target / rel)
-            copied += 1
-        except OSError:
-            continue
-    target.chmod(0o777)
     return target
 
 
@@ -242,7 +364,7 @@ async def run_and_correct_poc(
         script_path.write_bytes(encoded)
         script_path.chmod(0o644)
 
-        if STAGED_DIR_NAME not in script:
+        if f"/work/{STAGED_DIR_NAME}" not in script:
             record = PocAttempt(
                 attempt=attempt,
                 script=script,
@@ -253,6 +375,31 @@ async def run_and_correct_poc(
                     f"/work/{STAGED_DIR_NAME}. Compile or import the real file from "
                     f"/work/{STAGED_DIR_NAME}; do not mirror the function."
                 ),
+                success=False,
+            )
+            result.attempts.append(record)
+            await db.add_poc_run(
+                finding.id,
+                agent_id,
+                attempt,
+                -1,
+                False,
+                script,
+                "",
+                record.stderr,
+                container_id,
+            )
+            prior = record
+            continue
+
+        forged = script_forges_evidence(script)
+        if forged is not None:
+            record = PocAttempt(
+                attempt=attempt,
+                script=script,
+                exit_code=-1,
+                stdout="",
+                stderr=f"rejected: {forged}",
                 success=False,
             )
             result.attempts.append(record)
@@ -303,7 +450,13 @@ async def run_and_correct_poc(
             prior = record
             continue
         duration_ms = int((time.monotonic() - started) * 1000)
-        success = run.exit_code == 0 and SUCCESS_MARKER in run.stdout
+        evidence = poc_crash_evidence(
+            run.exit_code,
+            run.stdout,
+            run.stderr,
+            timed_out=bool(getattr(run, "timed_out", False)),
+        )
+        success = evidence is not None
         record = PocAttempt(
             attempt=attempt,
             script=script,
@@ -339,6 +492,7 @@ async def run_and_correct_poc(
             )
         if success:
             result.success = True
+            result.reason = evidence
             result.script_path = str(script_path)
             return result
         prior = record

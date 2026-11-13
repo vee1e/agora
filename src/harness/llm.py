@@ -22,11 +22,21 @@ DEFAULT_TIMEOUT = 120.0
 DEFAULT_TEMPERATURE = 0.7
 MAX_ATTEMPTS = 3
 RETRY_BACKOFF_BASE = 0.5
+MAX_RETRY_AFTER_SECONDS = 60.0
 ERROR_BODY_LIMIT = 2000
 
 
 class LLMError(Exception):
     pass
+
+
+def _usage_estimate(messages: list[dict[str, Any]], max_tokens: int) -> int:
+    """Conservative stand-in when the provider omits usage."""
+    chars = 0
+    for message in messages:
+        chars += len(str(message.get("content") or ""))
+    prompt_tokens = max(1, (chars + 3) // 4)
+    return prompt_tokens + max(1, int(max_tokens))
 
 
 class LLMBudgetError(LLMError):
@@ -159,22 +169,28 @@ class LLMClient:
         finish_reason = choice.get("finish_reason")
 
         usage_raw = data.get("usage")
-        usage_missing = not isinstance(usage_raw, dict)
-        if usage_missing:
-            usage = m.Usage()
-        else:
-            usage = m.Usage(
-                tokens_in=int(usage_raw.get("prompt_tokens") or 0),
-                tokens_out=int(usage_raw.get("completion_tokens") or 0),
-            )
+        usage_missing = (
+            not isinstance(usage_raw, dict)
+            or usage_raw.get("prompt_tokens") is None
+            or usage_raw.get("completion_tokens") is None
+        )
         model = data.get("model") or self.settings.llm_model
+        if usage_missing:
+            estimate = _usage_estimate(messages, max_tokens or self.settings.turn_token_budget)
+            if self.budget is not None and resolved_agent is not None:
+                await self.budget.record(resolved_agent, estimate)
+            last_error = "usage missing from provider response"
+            self._log_llm(resolved_agent, 0, 0, started, error=last_error, note="usage missing", model=model)
+            raise LLMError(last_error)
+        usage = m.Usage(
+            tokens_in=int(usage_raw.get("prompt_tokens") or 0),
+            tokens_out=int(usage_raw.get("completion_tokens") or 0),
+        )
 
         if self.budget is not None and resolved_agent is not None:
             await self.budget.record(resolved_agent, usage.total)
 
         notes: list[str] = []
-        if usage_missing:
-            notes.append("usage missing")
         if finish_reason:
             notes.append(str(finish_reason))
         note = "; ".join(notes) if notes else None
@@ -236,7 +252,7 @@ class LLMClient:
             except (TypeError, ValueError):
                 requested = None
             if requested is not None and requested > delay:
-                delay = requested
+                delay = min(requested, MAX_RETRY_AFTER_SECONDS)
         await asyncio.sleep(delay)
 
     def _log_llm(
